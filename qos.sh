@@ -242,6 +242,8 @@ format_duration() {
 load_config() {
     declare -gA PORT_RULES=()
     INTERFACE=""
+    # MONITOR_INTERVAL 只在未被外部设置时才从配置读取
+    local _mi_from_config=""
 
     if [ -f "$CONFIG_FILE" ]; then
         while IFS= read -r line; do
@@ -251,12 +253,18 @@ load_config() {
                 INTERFACE="${BASH_REMATCH[1]}"
                 continue
             fi
+            if [[ "$line" =~ ^MONITOR_INTERVAL=([0-9]+)$ ]]; then
+                _mi_from_config="${BASH_REMATCH[1]}"
+                continue
+            fi
             if [[ "$line" =~ ^PORT_RULES\[\"([^\"]+)\"\]=\"(.*)\"$ ]]; then
                 PORT_RULES["${BASH_REMATCH[1]}"]="${BASH_REMATCH[2]}"
                 continue
             fi
         done < "$CONFIG_FILE"
     fi
+
+    [ -n "$_mi_from_config" ] && MONITOR_INTERVAL="$_mi_from_config"
 
     if [ -z "$INTERFACE" ]; then
         INTERFACE=$(ip route 2>/dev/null | awk '/default/{print $5; exit}')
@@ -271,14 +279,14 @@ save_config() {
         echo "# 请勿手动修改，使用 qos 命令管理"
         echo ""
         echo "INTERFACE=\"$INTERFACE\""
+        echo "MONITOR_INTERVAL=${MONITOR_INTERVAL}"
         echo ""
         echo "# PORT_RULES[端口:协议]=\"1级速率 2级速率 触发带宽Mbps 触发持续秒 2级限速时长秒\""
-        echo "declare -A PORT_RULES"
         for key in "${!PORT_RULES[@]}"; do
             echo "PORT_RULES[\"$key\"]=\"${PORT_RULES[$key]}\""
         done
     } > "$CONFIG_FILE"
-    ok "配置已保存 → $CONFIG_FILE"
+    ok "配置已保存 -> $CONFIG_FILE"
     log "配置已保存"
 }
 
@@ -388,16 +396,15 @@ clear_rules() {
 # 使用 /proc/net/dev 计算增量，避免依赖 ifstat 单端口统计
 # ─────────────────────────────────────────────────────────
 get_iface_bw_mbps() {
-    # 返回接口总 TX+RX Mbps（两次采样差值）
+    # 只取 TX（上行）字节数，与限速方向一致
+    # /proc/net/dev 列: iface rx_bytes ... tx_bytes(第10列)
     local iface="$1" interval="${2:-$MONITOR_INTERVAL}"
-    local rx1 tx1 rx2 tx2
-    rx1=$(awk -v i="$iface:" '$1==i{print $2}' /proc/net/dev 2>/dev/null || echo 0)
+    local tx1 tx2
     tx1=$(awk -v i="$iface:" '$1==i{print $10}' /proc/net/dev 2>/dev/null || echo 0)
     sleep "$interval"
-    rx2=$(awk -v i="$iface:" '$1==i{print $2}' /proc/net/dev 2>/dev/null || echo 0)
     tx2=$(awk -v i="$iface:" '$1==i{print $10}' /proc/net/dev 2>/dev/null || echo 0)
-    local diff=$(( (rx2 - rx1) + (tx2 - tx1) ))
-    # bytes → Mbps
+    local diff=$(( tx2 - tx1 ))
+    [ "$diff" -lt 0 ] && diff=0   # 计数器回绕保护
     echo "scale=2; $diff * 8 / $interval / 1000000" | bc 2>/dev/null || echo "0"
 }
 
@@ -700,9 +707,9 @@ unlimit_port_now() {
 # ─────────────────────────────────────────────────────────
 show_rules() {
     echo ""
-    echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BOLD}${CYAN}║            QoS 端口限速 v3.0 — 当前规则（两级限速）                 ║${NC}"
-    echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
+    echo -e "${BOLD}${CYAN}+----------------------------------------------------------------------+${NC}"
+    echo -e "${BOLD}${CYAN}|         QoS 端口限速 v3.1 -- 当前规则（两级限速）                   |${NC}"
+    echo -e "${BOLD}${CYAN}+----------------------------------------------------------------------+${NC}"
     echo -e "  接口: ${BOLD}${INTERFACE}${NC}    采样间隔: ${MONITOR_INTERVAL}s"
     echo ""
     monitor_status
@@ -762,7 +769,7 @@ show_rules() {
             echo -e "  开机自启: ${DIM}未启用${NC}"
         fi
     fi
-    echo -e "${BOLD}${CYAN}══════════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}${CYAN}----------------------------------------------------------------------${NC}"
     echo ""
 }
 
@@ -782,20 +789,20 @@ interactive_add() {
     old_ldur=$(echo "$old_val" | awk '{print $5}')
 
     echo ""
-    echo -e "${BOLD}${BLUE}┌────────────────────────────────────────────────────────────────┐${NC}"
+    echo -e "${BOLD}${BLUE}+----------------------------------------------------------------+${NC}"
     if [ -n "$edit_key" ]; then
         local ep ep_proto
         ep=$(    echo "$edit_key" | cut -d: -f1)
         ep_proto=$(echo "$edit_key" | cut -d: -f2)
-        echo -e "${BOLD}${BLUE}│  修改端口两级限速规则                                          │${NC}"
-        echo -e "${BOLD}${BLUE}├────────────────────────────────────────────────────────────────┤${NC}"
+        echo -e "${BOLD}${BLUE}|  修改端口两级限速规则                                          |${NC}"
+        echo -e "${BOLD}${BLUE}+----------------------------------------------------------------+${NC}"
         echo -e "  当前: 端口 ${BOLD}${ep}${NC}(${ep_proto})  1级 ${BOLD}${old_rate1}${NC}  2级 ${BOLD}${old_rate2}${NC}  触发 ${BOLD}${old_tbw}Mbps${NC}/$(format_duration "$old_tdur")  2级时长 $(format_duration "$old_ldur")"
     else
-        echo -e "${BOLD}${BLUE}│  添加端口两级限速规则                                          │${NC}"
-        echo -e "${BOLD}${BLUE}├────────────────────────────────────────────────────────────────┤${NC}"
+        echo -e "${BOLD}${BLUE}|  添加端口两级限速规则                                          |${NC}"
+        echo -e "${BOLD}${BLUE}+----------------------------------------------------------------+${NC}"
         echo -e "  ${DIM}1级: 始终生效的基础限速；2级: 触发条件满足后自动降速，到期恢复1级${NC}"
     fi
-    echo -e "${BOLD}${BLUE}└────────────────────────────────────────────────────────────────┘${NC}"
+    echo -e "${BOLD}${BLUE}+----------------------------------------------------------------+${NC}"
     echo ""
 
     local port proto
@@ -909,17 +916,17 @@ interactive_add() {
 
     # ── 确认汇总 ─────────────────────────────────────────
     echo ""
-    echo -e "  ${BOLD}${CYAN}┌── 规则确认 ────────────────────────────────────────────────────┐${NC}"
-    echo -e "  ${BOLD}${CYAN}│${NC}  端口: ${BOLD}${port}${NC}  协议: ${BOLD}${proto}${NC}"
-    echo -e "  ${BOLD}${CYAN}│${NC}  ${GREEN}1级${NC}: 始终限速至 ${BOLD}${rate1}${NC}（监控启动即生效）"
-    echo -e "  ${BOLD}${CYAN}│${NC}  触发: 上行带宽 > ${BOLD}${trig_bw} Mbps${NC} 持续 ${BOLD}$(format_duration "$trig_dur")${NC}"
-    echo -e "  ${BOLD}${CYAN}│${NC}  ${RED}2级${NC}: 降速至 ${BOLD}${rate2}${NC}"
+    echo -e "  ${BOLD}${CYAN}+-- 规则确认 ----------------------------------------------------+${NC}"
+    echo -e "  ${BOLD}${CYAN}|${NC}  端口: ${BOLD}${port}${NC}  协议: ${BOLD}${proto}${NC}"
+    echo -e "  ${BOLD}${CYAN}|${NC}  ${GREEN}1级${NC}: 始终限速至 ${BOLD}${rate1}${NC}（监控启动即生效）"
+    echo -e "  ${BOLD}${CYAN}|${NC}  触发: 上行带宽 > ${BOLD}${trig_bw} Mbps${NC} 持续 ${BOLD}$(format_duration "$trig_dur")${NC}"
+    echo -e "  ${BOLD}${CYAN}|${NC}  ${RED}2级${NC}: 降速至 ${BOLD}${rate2}${NC}"
     if [ "$limit_dur" -gt 0 ] 2>/dev/null; then
-        echo -e "  ${BOLD}${CYAN}│${NC}  ${BOLD}$(format_duration "$limit_dur")${NC} 后自动恢复 ${GREEN}1级 ${rate1}${NC}，继续监控（可循环）"
+        echo -e "  ${BOLD}${CYAN}|${NC}  ${BOLD}$(format_duration "$limit_dur")${NC} 后自动恢复 ${GREEN}1级 ${rate1}${NC}，继续监控（可循环）"
     else
-        echo -e "  ${BOLD}${CYAN}│${NC}  永久2级，需手动从菜单恢复1级"
+        echo -e "  ${BOLD}${CYAN}|${NC}  永久2级，需手动从菜单恢复1级"
     fi
-    echo -e "  ${BOLD}${CYAN}└────────────────────────────────────────────────────────────────┘${NC}"
+    echo -e "  ${BOLD}${CYAN}+----------------------------------------------------------------+${NC}"
     echo ""
     read -rp "  确认保存? [Y/n]: " confirm
     [[ "${confirm:-Y}" =~ ^[Yy]$ ]] || { warn "已取消"; return; }
@@ -931,13 +938,13 @@ interactive_add() {
     log "规则: 端口=$port 协议=$proto 1级=$rate1 2级=$rate2 触发=${trig_bw}Mbps 持续=${trig_dur}s 2级时长=${limit_dur}s"
     save_config
     _notify_daemon_reload
-    echo -e "${BOLD}${BLUE}└────────────────────────────────────────────────────────────────┘${NC}"
+    echo -e "${BOLD}${BLUE}+----------------------------------------------------------------+${NC}"
 }
 
 interactive_edit() {
     [ ${#PORT_RULES[@]} -eq 0 ] && warn "没有可修改的规则" && return
     echo ""
-    echo -e "${BOLD}${BLUE}┌─ 选择要修改的规则 ──────────────────────────────────────────────┐${NC}"
+    echo -e "${BOLD}${BLUE}+-- 选择要修改的规则 --------------------------------------------+${NC}"
     local i=1; declare -a ekeys
     for key in "${!PORT_RULES[@]}"; do
         local val="${PORT_RULES[$key]}"
@@ -959,7 +966,7 @@ interactive_edit() {
 interactive_delete() {
     [ ${#PORT_RULES[@]} -eq 0 ] && warn "没有可删除的规则" && return
     echo ""
-    echo -e "${BOLD}${BLUE}┌─ 删除端口限速规则 ──────────────────────────────────────────────┐${NC}"
+    echo -e "${BOLD}${BLUE}+-- 删除端口限速规则 --------------------------------------------+${NC}"
     local i=1; declare -a dkeys
     for key in "${!PORT_RULES[@]}"; do
         local val="${PORT_RULES[$key]}"
@@ -982,39 +989,46 @@ interactive_delete() {
     else
         warn "已取消"
     fi
-    echo -e "${BOLD}${BLUE}└────────────────────────────────────────────────────────────────┘${NC}"
+    echo -e "${BOLD}${BLUE}+----------------------------------------------------------------+${NC}"
 }
 
 change_interface() {
     echo ""
-    echo -e "${BOLD}${BLUE}┌─ 更改网络接口 ──────────────────────────────────────────────────┐${NC}"
     local detected; detected=$(ip route 2>/dev/null | awk '/default/{print $5; exit}')
-    echo "  当前接口: ${BOLD}$INTERFACE${NC}"
-    [ -n "$detected" ] && echo "  检测默认: ${BOLD}$detected${NC}"
+    echo "  当前接口: ${BOLD}${INTERFACE}${NC}"
+    [ -n "$detected" ] && echo "  自动检测: ${BOLD}${detected}${NC}"
     echo ""
     echo "  可用接口:"
-    ip -o link show 2>/dev/null | awk -F': ' '{print "    • " $2}' | grep -v '• lo$'
+    ip -o link show 2>/dev/null | awk -F': ' '{print "    - " $2}' | grep -v '- lo$'
     echo ""
     read -rp "  输入接口名 [回车保持不变]: " new_iface
-    [ -n "$new_iface" ] && INTERFACE="$new_iface" && ok "接口已更改为: $INTERFACE" || info "接口未变更"
-    echo -e "${BOLD}${BLUE}└────────────────────────────────────────────────────────────────┘${NC}"
+    if [ -n "$new_iface" ]; then
+        INTERFACE="$new_iface"
+        ok "接口已更改为: $INTERFACE"
+        save_config
+        _notify_daemon_reload
+    else
+        info "接口未变更"
+    fi
 }
 
 change_interval() {
     echo ""
-    echo -e "${BOLD}${BLUE}┌─ 修改监控采样间隔 ──────────────────────────────────────────────┐${NC}"
-    echo "  当前采样间隔: ${BOLD}${MONITOR_INTERVAL}秒${NC}"
-    echo -e "  ${DIM}间隔越短越灵敏，但 CPU 占用越高。推荐 5-30 秒${NC}"
+    echo "  +-- 修改监控采样间隔 ------------------------------------+"
+    echo "  | 当前采样间隔: ${MONITOR_INTERVAL}s                                  |"
+    echo "  | 间隔越短越灵敏，CPU 占用越高。推荐 5-30 秒            |"
+    echo "  +--------------------------------------------------------+"
     echo ""
     local new_interval
     read -rp "  新采样间隔 (秒，回车保持不变): " new_interval
     if [[ "$new_interval" =~ ^[0-9]+$ ]] && [ "$new_interval" -ge 1 ]; then
         MONITOR_INTERVAL="$new_interval"
-        ok "采样间隔已设为 ${MONITOR_INTERVAL}秒"
+        ok "采样间隔已设为 ${MONITOR_INTERVAL}s"
+        save_config
+        _notify_daemon_reload
     else
-        [ -n "$new_interval" ] && err "无效值" || info "未变更"
+        [ -n "$new_interval" ] && err "无效值，请输入正整数" || info "未变更"
     fi
-    echo -e "${BOLD}${BLUE}└────────────────────────────────────────────────────────────────┘${NC}"
 }
 
 # ─────────────────────────────────────────────────────────
@@ -1025,7 +1039,7 @@ install_service() {
     cp -f "$0" "$SCRIPT_PATH"
     chmod +x "$SCRIPT_PATH"
 
-    cat > "$SERVICE_FILE" <<'SVCEOF'
+    cat > "$SERVICE_FILE" << SVCEOF
 [Unit]
 Description=QoS 端口限速监控服务
 After=network.target
@@ -1034,8 +1048,8 @@ Wants=network.target
 [Service]
 Type=forking
 PIDFile=/run/qos/monitor.pid
-ExecStart=/usr/local/bin/qos start
-ExecStop=/usr/local/bin/qos stop
+ExecStart=${QOS_BIN} start
+ExecStop=${QOS_BIN} stop
 Restart=on-failure
 RestartSec=10
 StandardOutput=journal
@@ -1094,15 +1108,15 @@ interactive_menu() {
     while true; do
         clear
         echo -e "${BOLD}${GREEN}"
-        echo "  ╔════════════════════════════════════════════════════════════╗"
-        echo "  ║          QoS 端口智能限速管理工具  v${QOS_VERSION}                ║"
-        echo "  ╚════════════════════════════════════════════════════════════╝${NC}"
+        echo "  +------------------------------------------------------------+"
+        echo "  |         QoS 端口智能限速管理工具  v${QOS_VERSION}                 |"
+        echo "  +------------------------------------------------------------+${NC}"
 
         # 有新版本时顶部横幅提示
         if $_update_available; then
-            echo -e "  ${BOLD}${YELLOW}┌─ 🔔 发现新版本 v${_remote_ver} ─────────────────────────────────────┐${NC}"
-            echo -e "  ${BOLD}${YELLOW}│  选择 'U) 在线更新' 即可一键升级                              │${NC}"
-            echo -e "  ${BOLD}${YELLOW}└────────────────────────────────────────────────────────────────┘${NC}"
+            echo -e "  ${BOLD}${YELLOW}+-- 发现新版本 v${_remote_ver} ------------------------------------------+${NC}"
+            echo -e "  ${BOLD}${YELLOW}|  选择 U) 在线更新 即可一键升级                                |${NC}"
+            echo -e "  ${BOLD}${YELLOW}+----------------------------------------------------------------+${NC}"
             echo ""
         fi
 
@@ -1155,13 +1169,9 @@ interactive_menu() {
             t|T) show_tc_status ;;
             l|L) show_log ;;
             i|I) save_config; install_service ;;
-            u|U_svc) uninstall_service ;;
-            u) uninstall_service ;;
+            u)   uninstall_service ;;
             d|D) bootstrap_deps force ;;
-            U)
-                do_update
-                # do_update 成功后会 exit 0，失败则继续
-                ;;
+            U)   do_update ;;
             R|r)
                 do_clean_reinstall
                 # 清理完重新检测更新状态
