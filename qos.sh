@@ -23,7 +23,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
 SCRIPT_SELF="$(realpath "$0" 2>/dev/null || readlink -f "$0")"
 QOS_BIN="/usr/bin/qos"
-QOS_VERSION="3.1.5"
+QOS_VERSION="3.1.6"
 QOS_UPDATE_URL="https://raw.githubusercontent.com/lyp88997/Server-QoS-Pro/refs/heads/main/qos.sh"
 
 _is_internal_cmd() {
@@ -1268,7 +1268,7 @@ interactive_menu() {
         printf "  13) 卸载系统服务\n"
         printf "  14) 重新检测/安装依赖\n"
         if $_update_available; then
-            printf "  ${BOLD}${YELLOW}U) 在线更新 -> v%s${NC}\n" "$_remote_ver"
+            printf "  ${BOLD}${YELLOW}15) 在线更新 -> v%s${NC}\n" "$_remote_ver"
         else
             printf "  15) 检查在线更新\n"
         fi
