@@ -1,44 +1,78 @@
-# ⚡ Server-QoS-Pro (v3.0)
+# Server-QoS-Pro
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Bash Shell](https://img.shields.io/badge/Language-Bash-4EAA25.svg)](https://www.gnu.org/software/bash/)
-[![Platform](https://img.shields.io/badge/Platform-Linux-lightgrey.svg)](https://www.kernel.org/)
+**Server-QoS-Pro** 是一款专为 Linux 服务器设计的智能端口限速与流量监控工具。它通过“基础限速 + 动态处罚”的双级策略，帮助管理员有效防止单端口带宽异常占用导致整机网络拥堵。
 
-**Server-QoS-Pro** 是一款专为 Linux 服务器设计的智能端口流量控制工具。它基于系统的 `TC (Traffic Control)` 和 `iptables` 内核架构，能够根据实时流量自动触发限速规则，并在设定的冷却时间后自动恢复，实现全自动的带宽管理与网络优化。
+## 🌟 核心特性
 
----
+* **智能两级限速逻辑**：
+* **Level 1 (常规层)**：始终生效的基础限速（如 30Mbps）。
+* **Level 2 (处罚层)**：当实时流量超过阈值并持续一定时间后，自动切换至更严格的限速（如 5Mbps）。
 
-## ✨ 核心特性
 
-* **🔍 智能双向监控**：实时监控指定端口的流量情况（支持 TCP/UDP/BOTH 协议）。
-* **⚖️ 动态触发机制**：支持“带宽阈值 × 持续时间”组合规则。只有当流量持续超标时才触发限制，精准识别异常占用。
-* **🔄 自动循环复原**：限速时长到期后，系统自动撤销限制并重新进入监控，无需人工手动干预。
-* **🛠️ 交互式管理菜单**：全中文交互式 CLI 界面，支持规则增删改查、网卡切换、采样频率调节。
-* **📦 生产级稳定性**：
-    * **环境自适应**：首次运行自动检测并补齐 `tc`, `iptables`, `bc` 等核心依赖。
-    * **系统服务化**：支持一键安装为 `systemd` 系统服务，确保服务器重启后自动运行。
-    * **全协议兼容**：采用 `fwmark` 标记技术，完美兼容 IPv4/IPv6 以及 NAT 复杂环境。
+* **全自动监控循环**：处罚时间到期后自动恢复 Level 1 并重新开启监控，实现真正的无人值守。
+* **双栈与 NAT 兼容**：采用 `iptables mangle` 标记 + `tc fw filter` 架构，完美支持 **IPv4/IPv6** 以及经过 **NAT/DNAT** 转换后的端口限速。
+* **极致交互体验**：内置交互式菜单，支持规则添加、修改、状态实时查看及日志审计，无需手动编辑配置文件。
+* **系统级集成**：支持 `systemd` 开机自启，自动检测并一键安装 `iproute2`, `bc`, `iptables` 等核心依赖。
 
----
+## 🛠️ 技术原理
+
+传统的 `tc u32` 匹配在处理内网 NAT（如 10.x.x.x）或 IPv4-mapped IPv6 时常会失效。本项目采用了更可靠的链路追踪方案：
+
+1. **打标 (Marking)**：在 `iptables` 的 `POSTROUTING` 链中根据服务源端口对数据包进行 `fwmark` 标记。
+2. **调度 (Queuing)**：在 `tc` 中构建 `HTB` (Hierarchical Token Bucket) 树状结构，并使用 `sfq` 公平队列优化连接。
+3. **计算 (Calculation)**：通过解析 `/proc/net/dev` 获取极低延迟的带宽采样，避免了外部工具的高开销。
 
 ## 🚀 快速开始
 
-### 1. 一键安装与配置
-在你的 Linux 服务器上执行以下命令（支持 Debian/Ubuntu/CentOS/Alpine）：
+### 1. 安装与初始化
+
+下载脚本并执行 `setup` 命令，脚本将自动完成依赖检查、快捷命令注册及系统服务配置。
 
 ```bash
 wget -O qos.sh https://raw.githubusercontent.com/lyp88997/Server-QoS-Pro/refs/heads/main/qos.sh && bash qos.sh setup
 ```
 
-2. 快捷指令
-安装完成后，你可以在任何位置直接输入以下快捷命令：
+### 2. 启动管理菜单
 
-• qos - 进入交互式管理主菜单
+安装完成后，在终端直接输入以下命令即可进入可视化管理界面：
 
-• qos start - 启动后台监控进程
+```bash
+qos
 
-• qos stop - 停止后台监控进程
+```
 
-• qos status - 查看当前所有端口的实时监控与限速状态
+### 3. 常用指令汇总
 
-• qos clear - 一键强制清除所有流量控制规则
+| 指令 | 描述 |
+| --- | --- |
+| `qos` | 启动交互式管理菜单 |
+| `qos start` | 启动后台监控守护进程 |
+| `qos stop` | 停止监控守护进程 |
+| `qos status` | 实时查看各规则状态、剩余处罚时间及带宽 |
+| `qos clear` | 清空所有 TC 限制及 iptables 规则（紧急恢复） |
+
+## 📖 配置示例
+
+**场景**：限制 443 端口，平时保障 50Mbps 速度。如果带宽超过 100Mbps 且持续 1 分钟，则降速至 10Mbps，处罚 30 分钟。
+
+* **端口**: `443`
+* **1级速率**: `50mbit`
+* **2级速率**: `10mbit`
+* **触发阈值**: `100 Mbps`
+* **持续时间**: `60s`
+* **处罚时长**: `1800s`
+
+## 📂 文件说明
+
+* **主执行程序**: `/usr/bin/qos`
+* **配置文件**: `/etc/qos/qos.conf`
+* **操作日志**: `/var/log/qos.log`
+* **状态缓存**: `/run/qos/`
+
+## 🤝 贡献与支持
+
+如果您在使用中遇到任何问题（如特定发行版的依赖缺失），欢迎提交 Issue 或 Pull Request。
+
+---
+
+**提示**：建议在首次配置后通过 `qos status` 观察数据采样是否准确，确保网卡名称 (`eth0`/`ens3`等) 识别正确。
