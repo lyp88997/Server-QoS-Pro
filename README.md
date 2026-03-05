@@ -28,9 +28,9 @@
 
 ```bash
 wget -O qos.sh [https://raw.githubusercontent.com/lyp88997/Server-QoS-Pro/refs/heads/main/qos.sh](https://raw.githubusercontent.com/lyp88997/Server-QoS-Pro/refs/heads/main/qos.sh) && sudo bash qos.sh setup
+```
 
-
-#2. 快捷指令
+2. 快捷指令
 安装完成后，你可以在任何位置直接输入以下快捷命令：
 • qos - 进入交互式管理主菜单
 • qos start - 启动后台监控进程
