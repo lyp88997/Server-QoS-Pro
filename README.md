@@ -26,9 +26,7 @@
 ### 1. 一键安装与配置
 在你的 Linux 服务器上执行以下命令（支持 Debian/Ubuntu/CentOS/Alpine）：
 
-```bash
-wget -O qos.sh [https://raw.githubusercontent.com/lyp88997/Server-QoS-Pro/refs/heads/main/qos.sh](https://raw.githubusercontent.com/lyp88997/Server-QoS-Pro/refs/heads/main/qos.sh) && sudo bash qos.sh setup
-```
+```wget -O qos.sh https://raw.githubusercontent.com/lyp88997/Server-QoS-Pro/refs/heads/main/qos.sh && bash qos.sh setup```
 
 2. 快捷指令
 安装完成后，你可以在任何位置直接输入以下快捷命令：
