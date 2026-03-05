@@ -23,7 +23,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
 SCRIPT_SELF="$(realpath "$0" 2>/dev/null || readlink -f "$0")"
 QOS_BIN="/usr/bin/qos"
-QOS_VERSION="3.1.2"
+QOS_VERSION="3.1.3"
 QOS_UPDATE_URL="https://raw.githubusercontent.com/lyp88997/Server-QoS-Pro/refs/heads/main/qos.sh"
 
 _is_internal_cmd() {
@@ -1211,18 +1211,18 @@ interactive_menu() {
         printf "  7) 保存配置\n"
         printf "  8) 更改网络接口\n"
         printf "  9) 修改监控采样间隔 (当前: %ss)\n" "$MONITOR_INTERVAL"
-        printf "  t) 查看 TC 底层状态\n"
-        printf "  l) 查看运行日志\n"
+        printf "  10) 查看 TC 底层状态\n"
+        printf "  11) 查看运行日志\n"
         printf "%s\n" "$_sep"
-        printf "  i) 安装/更新系统服务 (开机自启)\n"
-        printf "  D) 卸载系统服务\n"
-        printf "  d) 重新检测/安装依赖\n"
+        printf "  12) 安装/更新系统服务 (开机自启)\n"
+        printf "  13) 卸载系统服务\n"
+        printf "  14) 重新检测/安装依赖\n"
         if $_update_available; then
             printf "  ${BOLD}${YELLOW}U) 在线更新 -> v%s${NC}\n" "$_remote_ver"
         else
-            printf "  U) 检查在线更新\n"
+            printf "  15) 检查在线更新\n"
         fi
-        printf "  R) 清理旧配置并重新安装 (保留规则)\n"
+        printf "  16) 清理旧配置并重新安装 (保留规则)\n"
         printf "  0) 退出\n"
         printf "%s\n" "$_sep"
         read -rp "  请选择: " choice
