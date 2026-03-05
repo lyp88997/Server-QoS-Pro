@@ -619,7 +619,7 @@ unlimit_port_now() {
 show_rules() {
     echo ""
     echo -e "${BOLD}${CYAN}╔═════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BOLD}${CYAN}║              QoS端口限速 v3.0 — 当前规则               ║${NC}"
+    echo -e "${BOLD}${CYAN}               QoS端口限速 v3.0 — 当前规则                 ${NC}"
     echo -e "${BOLD}${CYAN}╚═════════════════════════════════════════════════════╝${NC}"
     echo -e "  接口: ${BOLD}${INTERFACE}${NC}    采样间隔: ${MONITOR_INTERVAL}s"
     echo ""
@@ -988,7 +988,7 @@ interactive_menu() {
         clear
         echo -e "${BOLD}${GREEN}"
         echo "  ╔═════════════════════════════════════════════════════╗"
-        echo "  ║          QoS 端口智能限速管理工具  v3.0                 ║"
+        echo "             QoS 端口智能限速管理工具  v3.0                   "
         echo "  ╚═════════════════════════════════════════════════════╝${NC}"
 
         show_rules
