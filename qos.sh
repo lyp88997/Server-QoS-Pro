@@ -415,41 +415,100 @@ monitor_daemon() {
     log "监控守护进程启动 (PID=$$, 接口=$INTERFACE)"
     echo $$ > "${STATE_DIR}/monitor.pid"
 
+    # SIGHUP 触发热重载标志
+    _RELOAD_FLAG=0
+    trap '_RELOAD_FLAG=1' HUP
+
     # 初始化 TC 根结构
     init_tc
 
-    # 为每个规则分配固定 handle
+    # 构建 handle 映射并下发 1 级限速的函数（启动和热重载共用）
+    _apply_rules() {
+        local old_keys_snapshot="$1"   # 空格分隔的旧 key 列表，用于清理已删除端口
+
+        # 清理已被删除的端口的 TC 类和 iptables mark
+        for old_key in $old_keys_snapshot; do
+            if [ -z "${PORT_RULES[$old_key]+x}" ]; then
+                local op op_proto oh
+                op=$(echo "$old_key" | cut -d: -f1)
+                op_proto=$(echo "$old_key" | cut -d: -f2)
+                oh="${PORT_HANDLE[$old_key]:-0}"
+                [ "$oh" -gt 0 ] && _ipt_clear_port "$op" "$op_proto" "$oh" 2>/dev/null || true
+                [ "$oh" -gt 0 ] && tc class change dev "$INTERFACE" parent 1: classid "1:${oh}" \
+                    htb rate 10gbit ceil 10gbit 2>/dev/null || true
+                unset "PORT_HANDLE[$old_key]"
+                local sdir="${STATE_DIR}/${old_key//:/_}"
+                rm -rf "$sdir"
+                log "规则已删除，清理 TC: $old_key"
+            fi
+        done
+
+        # 为新端口分配 handle，已有端口保持不变
+        local h=10
+        for key in "${!PORT_RULES[@]}"; do
+            # 找一个未被占用的 handle
+            while true; do
+                local taken=false
+                for k in "${!PORT_HANDLE[@]}"; do
+                    [ "${PORT_HANDLE[$k]}" = "$h" ] && taken=true && break
+                done
+                $taken && h=$(( h + 10 )) || break
+            done
+            if [ -z "${PORT_HANDLE[$key]+x}" ]; then
+                PORT_HANDLE[$key]=$h
+                h=$(( h + 10 ))
+            fi
+        done
+
+        # 对每个规则下发/更新 TC 限速
+        for key in "${!PORT_RULES[@]}"; do
+            local val="${PORT_RULES[$key]}"
+            local rate1 port proto
+            rate1=$(echo "$val" | awk '{print $1}')
+            port=$( echo "$key" | cut -d: -f1)
+            proto=$(echo "$key" | cut -d: -f2)
+            local hh="${PORT_HANDLE[$key]}"
+            local sdir="${STATE_DIR}/${key//:/_}"
+            mkdir -p "$sdir"
+
+            local cur_status; cur_status=$(cat "${sdir}/status" 2>/dev/null || echo "")
+
+            if [ -z "$cur_status" ]; then
+                # 全新端口：初始化为 level1
+                tc_limit_port "$port" "$proto" "$rate1" "$hh"
+                echo "level1" > "${sdir}/status"
+                rm -f "${sdir}/high_since" "${sdir}/limit_until"
+                ok "端口 ${BOLD}${port}${NC}(${proto})  1级限速已启用: ${BOLD}${rate1}${NC}"
+                log "端口 $port($proto) 新增，1级限速: $rate1"
+            elif [ "$cur_status" = "level1" ]; then
+                # 已在 level1，更新速率（参数可能变了）
+                tc_limit_port "$port" "$proto" "$rate1" "$hh"
+                log "端口 $port($proto) 参数更新，1级速率重下发: $rate1"
+            fi
+            # level2 状态下不干预速率，等自然到期回 level1
+        done
+    }
+
+    # 首次初始化
     declare -A PORT_HANDLE
-    local h=10
-    for key in "${!PORT_RULES[@]}"; do
-        PORT_HANDLE[$key]=$h
-        h=$(( h + 10 ))
-    done
-
-    # 初始化：为所有端口下发 1 级限速，并设状态为 level1
-    for key in "${!PORT_RULES[@]}"; do
-        local val="${PORT_RULES[$key]}"
-        local rate1 port proto
-        rate1=$(echo "$val" | awk '{print $1}')
-        port=$( echo "$key" | cut -d: -f1)
-        proto=$(echo "$key" | cut -d: -f2)
-        local hh="${PORT_HANDLE[$key]}"
-
-        tc_limit_port "$port" "$proto" "$rate1" "$hh"
-
-        local sdir="${STATE_DIR}/${key//:/_}"
-        mkdir -p "$sdir"
-        echo "level1" > "${sdir}/status"
-        rm -f "${sdir}/high_since" "${sdir}/limit_until"
-        ok "端口 ${BOLD}${port}${NC}(${proto})  1级限速已启用: ${BOLD}${rate1}${NC}"
-        log "端口 $port($proto) 1级限速启用: $rate1"
-    done
-
+    _apply_rules ""
     info "开始监控 ${#PORT_RULES[@]} 条端口规则..."
     echo ""
 
     while true; do
-        load_config
+        # 收到 SIGHUP → 热重载配置
+        if [ "$_RELOAD_FLAG" = "1" ]; then
+            _RELOAD_FLAG=0
+            local old_keys="${!PORT_RULES[*]}"
+            load_config
+            log "收到 SIGHUP，重载配置..."
+            info "配置已变更，重新应用规则..."
+            _apply_rules "$old_keys"
+            info "热重载完成，当前监控 ${#PORT_RULES[@]} 条规则"
+            echo ""
+        fi
+
+        load_config   # 仍保留轮询加载（兼容直接编辑配置文件的场景）
 
         local now; now=$(date +%s)
         local iface_bw
@@ -577,6 +636,20 @@ stop_monitor() {
         fi
     else
         warn "监控守护进程未运行"
+    fi
+}
+
+# 通知守护进程重新加载配置（发 SIGHUP）
+# 若守护进程未运行则跳过
+_notify_daemon_reload() {
+    local pid_file="${STATE_DIR}/monitor.pid"
+    if [ -f "$pid_file" ]; then
+        local pid; pid=$(cat "$pid_file")
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -HUP "$pid" 2>/dev/null
+            ok "已通知监控进程重载配置（立即生效）"
+            log "发送 SIGHUP 至守护进程 PID=$pid"
+        fi
     fi
 }
 
@@ -855,8 +928,9 @@ interactive_add() {
     [ -n "$edit_key" ] && [ "$edit_key" != "$new_key" ] && unset "PORT_RULES[$edit_key]"
 
     PORT_RULES["$new_key"]="${rate1} ${rate2} ${trig_bw} ${trig_dur} ${limit_dur}"
-    ok "规则已保存 ✓  （记得选「保存配置」写入磁盘）"
     log "规则: 端口=$port 协议=$proto 1级=$rate1 2级=$rate2 触发=${trig_bw}Mbps 持续=${trig_dur}s 2级时长=${limit_dur}s"
+    save_config
+    _notify_daemon_reload
     echo -e "${BOLD}${BLUE}└────────────────────────────────────────────────────────────────┘${NC}"
 }
 
@@ -903,6 +977,8 @@ interactive_delete() {
         rm -rf "${STATE_DIR}/${dk//:/_}"
         ok "已删除规则: $dk"
         log "删除规则: $dk"
+        save_config
+        _notify_daemon_reload
     else
         warn "已取消"
     fi
