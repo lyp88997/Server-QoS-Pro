@@ -23,7 +23,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
 SCRIPT_SELF="$(realpath "$0" 2>/dev/null || readlink -f "$0")"
 QOS_BIN="/usr/bin/qos"
-QOS_VERSION="3.1.3"
+QOS_VERSION="3.1.4"
 QOS_UPDATE_URL="https://raw.githubusercontent.com/lyp88997/Server-QoS-Pro/refs/heads/main/qos.sh"
 
 _is_internal_cmd() {
@@ -1240,13 +1240,13 @@ interactive_menu() {
             7) save_config ;;
             8) change_interface ;;
             9) change_interval ;;
-            t|T) show_tc_status ;;
-            l|L) show_log ;;
-            i|I) save_config; install_service ;;
-            u)   uninstall_service ;;
-            d|D) bootstrap_deps force ;;
-            U)   do_update ;;
-            R|r)
+            10) show_tc_status ;;
+            11) show_log ;;
+            12) save_config; install_service ;;
+            13)   uninstall_service ;;
+            14) bootstrap_deps force ;;
+            15)   do_update ;;
+            16)
                 do_clean_reinstall
                 # 清理完重新检测更新状态
                 _remote_ver=$(_remote_version "$QOS_UPDATE_URL" 2>/dev/null)
