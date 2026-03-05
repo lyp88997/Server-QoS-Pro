@@ -23,6 +23,8 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
 SCRIPT_SELF="$(realpath "$0" 2>/dev/null || readlink -f "$0")"
 QOS_BIN="/usr/bin/qos"
+QOS_VERSION="3.1.0"
+QOS_UPDATE_URL="https://raw.githubusercontent.com/lyp88997/Server-QoS-Pro/refs/heads/main/qos.sh"
 
 _is_internal_cmd() {
     case "${1:-}" in
@@ -231,28 +233,24 @@ format_duration() {
 # ─────────────────────────────────────────────────────────
 # 加载配置
 #
-# PORT_RULES[端口:协议] = "限速值 触发带宽Mbps 触发持续秒 限速时长秒"
-# 示例: PORT_RULES[443:tcp] = "10mbit 80 300 180"
-#   → 当 443/tcp 超过 80Mbps 持续 300 秒，限速至 10mbit，持续 180 秒后解除
+# PORT_RULES[端口:协议] = "1级速率 2级速率 触发带宽Mbps 触发持续秒 2级限速时长秒"
+# 示例: PORT_RULES[443:tcp] = "30mbit 5mbit 80 300 600"
+#   → 默认以 30mbit 运行（1级）
+#   → 带宽超过 80Mbps 持续 300s → 降至 5mbit（2级）
+#   → 600s 后自动恢复 30mbit（回1级），继续监控，可循环
 # ─────────────────────────────────────────────────────────
 load_config() {
-    # 先声明全局空数组，避免 source 在函数作用域内 declare -A 数据丢失
     declare -gA PORT_RULES=()
     INTERFACE=""
 
     if [ -f "$CONFIG_FILE" ]; then
-        # 逐行解析配置，彻底规避 bash 函数内 source+declare 作用域问题
         while IFS= read -r line; do
-            [[ "$line" =~ ^[[:space:]]*# ]] && continue   # 跳过注释
-            [[ -z "${line// }" ]] && continue              # 跳过空行
-
-            # INTERFACE="eth0"
+            [[ "$line" =~ ^[[:space:]]*# ]] && continue
+            [[ -z "${line// }" ]] && continue
             if [[ "$line" =~ ^INTERFACE=\"(.*)\"$ ]]; then
                 INTERFACE="${BASH_REMATCH[1]}"
                 continue
             fi
-
-            # PORT_RULES["443:tcp"]="60mbit 80 120 1200"
             if [[ "$line" =~ ^PORT_RULES\[\"([^\"]+)\"\]=\"(.*)\"$ ]]; then
                 PORT_RULES["${BASH_REMATCH[1]}"]="${BASH_REMATCH[2]}"
                 continue
@@ -274,7 +272,7 @@ save_config() {
         echo ""
         echo "INTERFACE=\"$INTERFACE\""
         echo ""
-        echo "# PORT_RULES[端口:协议]=\"限速值 触发带宽Mbps 触发持续秒 限速时长秒\""
+        echo "# PORT_RULES[端口:协议]=\"1级速率 2级速率 触发带宽Mbps 触发持续秒 2级限速时长秒\""
         echo "declare -A PORT_RULES"
         for key in "${!PORT_RULES[@]}"; do
             echo "PORT_RULES[\"$key\"]=\"${PORT_RULES[$key]}\""
@@ -420,7 +418,7 @@ monitor_daemon() {
     # 初始化 TC 根结构
     init_tc
 
-    # 为每个规则分配 handle，建立 handle 映射
+    # 为每个规则分配固定 handle
     declare -A PORT_HANDLE
     local h=10
     for key in "${!PORT_RULES[@]}"; do
@@ -428,110 +426,115 @@ monitor_daemon() {
         h=$(( h + 10 ))
     done
 
-    # 初始化状态文件
+    # 初始化：为所有端口下发 1 级限速，并设状态为 level1
     for key in "${!PORT_RULES[@]}"; do
+        local val="${PORT_RULES[$key]}"
+        local rate1 port proto
+        rate1=$(echo "$val" | awk '{print $1}')
+        port=$( echo "$key" | cut -d: -f1)
+        proto=$(echo "$key" | cut -d: -f2)
+        local hh="${PORT_HANDLE[$key]}"
+
+        tc_limit_port "$port" "$proto" "$rate1" "$hh"
+
         local sdir="${STATE_DIR}/${key//:/_}"
         mkdir -p "$sdir"
-        echo "normal" > "${sdir}/status"
+        echo "level1" > "${sdir}/status"
         rm -f "${sdir}/high_since" "${sdir}/limit_until"
+        ok "端口 ${BOLD}${port}${NC}(${proto})  1级限速已启用: ${BOLD}${rate1}${NC}"
+        log "端口 $port($proto) 1级限速启用: $rate1"
     done
 
     info "开始监控 ${#PORT_RULES[@]} 条端口规则..."
     echo ""
 
     while true; do
-        # 重新加载配置（支持运行中热更新）
         load_config
 
         local now; now=$(date +%s)
-        # 采样当前接口带宽
         local iface_bw
         iface_bw=$(get_iface_bw_mbps "$INTERFACE" "$MONITOR_INTERVAL")
 
         for key in "${!PORT_RULES[@]}"; do
             local val="${PORT_RULES[$key]}"
-            local rate trig_bw trig_dur limit_dur port proto
-            rate=$(     echo "$val" | awk '{print $1}')   # 限速值，如 10mbit
-            trig_bw=$(  echo "$val" | awk '{print $2}')   # 触发带宽 Mbps
-            trig_dur=$( echo "$val" | awk '{print $3}')   # 触发持续秒
-            limit_dur=$(echo "$val" | awk '{print $4}')   # 限速时长秒（0=永久）
+            local rate1 rate2 trig_bw trig_dur limit_dur port proto
+            rate1=$(    echo "$val" | awk '{print $1}')   # 1级速率（默认）
+            rate2=$(    echo "$val" | awk '{print $2}')   # 2级速率（触发后）
+            trig_bw=$(  echo "$val" | awk '{print $3}')   # 触发带宽阈值 Mbps
+            trig_dur=$( echo "$val" | awk '{print $4}')   # 触发持续秒
+            limit_dur=$(echo "$val" | awk '{print $5}')   # 2级限速时长秒（0=永久）
             port=$( echo "$key" | cut -d: -f1)
             proto=$(echo "$key" | cut -d: -f2)
 
             local sdir="${STATE_DIR}/${key//:/_}"
             mkdir -p "$sdir"
-            local status; status=$(cat "${sdir}/status" 2>/dev/null || echo "normal")
+            local status; status=$(cat "${sdir}/status" 2>/dev/null || echo "level1")
             local handle="${PORT_HANDLE[$key]:-10}"
+            local ts; ts=$(date '+%H:%M:%S')
 
-            # ── 当前处于限速状态 ──────────────────────────────
-            if [ "$status" = "limited" ]; then
+            # ── 当前处于 2 级限速状态 ────────────────────────
+            if [ "$status" = "level2" ]; then
                 local limit_until; limit_until=$(cat "${sdir}/limit_until" 2>/dev/null || echo 0)
 
                 if [ "$limit_dur" -gt 0 ] 2>/dev/null && [ "$now" -ge "$limit_until" ]; then
-                    # 限速时长到期，解除
-                    tc_unlimit_port "$handle" "$port" "$proto"
-                    echo "normal" > "${sdir}/status"
+                    # 2级到期 → 恢复至1级
+                    tc_limit_port "$port" "$proto" "$rate1" "$handle"
+                    echo "level1" > "${sdir}/status"
                     rm -f "${sdir}/high_since" "${sdir}/limit_until"
-                    local ts; ts=$(date '+%H:%M:%S')
-                    echo -e "${GREEN}[${ts}]${NC} 端口 ${BOLD}${port}${NC}(${proto})  限速到期 → ${GREEN}恢复正常${NC}"
-                    log "端口 $port($proto) 限速到期，已自动解除，继续监控"
+                    echo -e "${GREEN}[${ts}]${NC} 端口 ${BOLD}${port}${NC}(${proto})  2级到期 → ${GREEN}恢复 1级 ${rate1}${NC}  继续监控"
+                    log "端口 $port($proto) 2级到期，恢复1级 $rate1，继续监控"
                 else
-                    # 仍在限速中，显示剩余时间
                     local remain=$(( limit_until - now ))
-                    local ts; ts=$(date '+%H:%M:%S')
+                    [ "$remain" -lt 0 ] && remain=0
                     if [ "$limit_dur" -gt 0 ] 2>/dev/null; then
-                        echo -e "${DIM}[${ts}]${NC} 端口 ${port}(${proto})  ${RED}限速中${NC}  剩余 $(format_duration "$remain")"
+                        echo -e "${DIM}[${ts}]${NC} 端口 ${port}(${proto})  ${RED}●2级限速${NC} ${rate2}  剩余 $(format_duration "$remain")"
                     else
-                        echo -e "${DIM}[${ts}]${NC} 端口 ${port}(${proto})  ${RED}永久限速中${NC}"
+                        echo -e "${DIM}[${ts}]${NC} 端口 ${port}(${proto})  ${RED}●2级限速${NC} ${rate2}  ${DIM}[永久]${NC}"
                     fi
                 fi
                 continue
             fi
 
-            # ── 当前处于正常状态，监测带宽 ───────────────────
-            # 用接口总带宽近似（精确端口带宽需 conntrack，成本高）
+            # ── 当前处于 1 级限速状态，监测带宽 ─────────────
             local current_bw="$iface_bw"
-            local ts; ts=$(date '+%H:%M:%S')
-
             local over; over=$(echo "$current_bw > $trig_bw" | bc -l 2>/dev/null || echo 0)
+
             if [ "$over" = "1" ]; then
-                # 带宽超过阈值
                 if [ ! -f "${sdir}/high_since" ]; then
                     echo "$now" > "${sdir}/high_since"
-                    echo -e "${YELLOW}[${ts}]${NC} 端口 ${BOLD}${port}${NC}(${proto})  带宽 ${BOLD}${current_bw}Mbps${NC} > 阈值 ${trig_bw}Mbps  开始计时..."
-                    log "端口 $port($proto) 带宽 ${current_bw}Mbps 超过阈值 ${trig_bw}Mbps，开始计时"
+                    echo -e "${YELLOW}[${ts}]${NC} 端口 ${BOLD}${port}${NC}(${proto})  ${YELLOW}●1级${NC} ${rate1}  带宽 ${BOLD}${current_bw}Mbps${NC} > 阈值 ${trig_bw}Mbps  开始计时..."
+                    log "端口 $port($proto) 带宽 ${current_bw}Mbps 超阈值 ${trig_bw}Mbps，开始计时"
                 else
                     local high_since; high_since=$(cat "${sdir}/high_since")
                     local elapsed=$(( now - high_since ))
 
                     if [ "$elapsed" -ge "$trig_dur" ]; then
-                        # 持续时间已达到触发条件，开始限速
-                        tc_limit_port "$port" "$proto" "$rate" "$handle"
-                        echo "limited" > "${sdir}/status"
+                        # 触发 2 级限速
+                        tc_limit_port "$port" "$proto" "$rate2" "$handle"
+                        echo "level2" > "${sdir}/status"
+                        rm -f "${sdir}/high_since"
 
                         if [ "$limit_dur" -gt 0 ] 2>/dev/null; then
                             echo $(( now + limit_dur )) > "${sdir}/limit_until"
-                            echo -e "${RED}[${ts}]${NC} 端口 ${BOLD}${port}${NC}(${proto})  ⚡ 触发限速！带宽 ${current_bw}Mbps 持续 $(format_duration "$elapsed")  → 限速至 ${BOLD}${rate}${NC}  限速 $(format_duration "$limit_dur") 后自动解除"
-                            log "端口 $port($proto) 触发限速: ${current_bw}Mbps 持续 ${elapsed}s → 限速 $rate，时长 ${limit_dur}s"
+                            echo -e "${RED}[${ts}]${NC} 端口 ${BOLD}${port}${NC}(${proto})  ⚡ 触发2级！${current_bw}Mbps 持续 $(format_duration "$elapsed")  → ${BOLD}${rate2}${NC}  $(format_duration "$limit_dur") 后恢复 ${rate1}"
+                            log "端口 $port($proto) 触发2级: ${current_bw}Mbps 持续 ${elapsed}s → $rate2，${limit_dur}s 后恢复 $rate1"
                         else
                             echo "0" > "${sdir}/limit_until"
-                            echo -e "${RED}[${ts}]${NC} 端口 ${BOLD}${port}${NC}(${proto})  ⚡ 触发限速！带宽 ${current_bw}Mbps 持续 $(format_duration "$elapsed")  → 限速至 ${BOLD}${rate}${NC}  ${DIM}[永久，需手动解除]${NC}"
-                            log "端口 $port($proto) 触发永久限速: ${current_bw}Mbps 持续 ${elapsed}s → 限速 $rate"
+                            echo -e "${RED}[${ts}]${NC} 端口 ${BOLD}${port}${NC}(${proto})  ⚡ 触发2级！${current_bw}Mbps 持续 $(format_duration "$elapsed")  → ${BOLD}${rate2}${NC}  ${DIM}[永久，需手动恢复]${NC}"
+                            log "端口 $port($proto) 触发2级永久: ${current_bw}Mbps 持续 ${elapsed}s → $rate2"
                         fi
-                        rm -f "${sdir}/high_since"
                     else
                         local need=$(( trig_dur - elapsed ))
-                        echo -e "${YELLOW}[${ts}]${NC} 端口 ${port}(${proto})  带宽 ${BOLD}${current_bw}Mbps${NC}  已持续 $(format_duration "$elapsed")  还需 $(format_duration "$need") 触发限速"
+                        echo -e "${YELLOW}[${ts}]${NC} 端口 ${port}(${proto})  ${YELLOW}●1级${NC} ${rate1}  ${current_bw}Mbps  计时 $(format_duration "$elapsed") / $(format_duration "$trig_dur")  还需 $(format_duration "$need")"
                     fi
                 fi
             else
-                # 带宽正常
                 if [ -f "${sdir}/high_since" ]; then
-                    echo -e "${GREEN}[${ts}]${NC} 端口 ${port}(${proto})  带宽回落至 ${current_bw}Mbps ≤ ${trig_bw}Mbps  计时重置"
+                    echo -e "${GREEN}[${ts}]${NC} 端口 ${port}(${proto})  ${GREEN}●1级${NC} ${rate1}  带宽回落 ${current_bw}Mbps ≤ ${trig_bw}Mbps  计时重置"
                     log "端口 $port($proto) 带宽回落 ${current_bw}Mbps，计时重置"
                     rm -f "${sdir}/high_since"
                 else
-                    echo -e "${DIM}[${ts}]${NC} 端口 ${port}(${proto})  正常  ${current_bw}Mbps / ${trig_bw}Mbps"
+                    echo -e "${DIM}[${ts}]${NC} 端口 ${port}(${proto})  ${GREEN}●1级${NC} ${rate1}  ${current_bw}Mbps / 阈值 ${trig_bw}Mbps"
                 fi
             fi
         done
@@ -591,26 +594,32 @@ monitor_status() {
 }
 
 # ─────────────────────────────────────────────────────────
-# 手动立即解除某端口限速
+# 手动将端口从 2级 恢复到 1级
 # ─────────────────────────────────────────────────────────
 unlimit_port_now() {
     local port="$1" proto="$2"
     local key="${port}:${proto}"
     local sdir="${STATE_DIR}/${key//:/_}"
 
-    # 找 handle
     load_config
+    local val="${PORT_RULES[$key]:-}"
+    if [ -z "$val" ]; then
+        err "未找到端口 $port($proto) 的规则"; return 1
+    fi
+    local rate1; rate1=$(echo "$val" | awk '{print $1}')
+
+    # 找 handle
     local h=10
     for k in "${!PORT_RULES[@]}"; do
         [ "$k" = "$key" ] && break
         h=$(( h + 10 ))
     done
 
-    tc_unlimit_port "$h" "$port" "$proto"
-    echo "normal" > "${sdir}/status"
+    tc_limit_port "$port" "$proto" "$rate1" "$h"
+    echo "level1" > "${sdir}/status"
     rm -f "${sdir}/high_since" "${sdir}/limit_until"
-    ok "端口 $port($proto) 限速已手动解除"
-    log "端口 $port($proto) 手动解除限速"
+    ok "端口 $port($proto) 已手动恢复至 1级限速: $rate1"
+    log "端口 $port($proto) 手动恢复1级: $rate1"
 }
 
 # ─────────────────────────────────────────────────────────
@@ -618,9 +627,9 @@ unlimit_port_now() {
 # ─────────────────────────────────────────────────────────
 show_rules() {
     echo ""
-    echo -e "${BOLD}${CYAN}╔═════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BOLD}${CYAN}               QoS端口限速 v3.0 — 当前规则                 ${NC}"
-    echo -e "${BOLD}${CYAN}╚═════════════════════════════════════════════════════╝${NC}"
+    echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${BOLD}${CYAN}║            QoS 端口限速 v3.0 — 当前规则（两级限速）                 ║${NC}"
+    echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
     echo -e "  接口: ${BOLD}${INTERFACE}${NC}    采样间隔: ${MONITOR_INTERVAL}s"
     echo ""
     monitor_status
@@ -629,17 +638,18 @@ show_rules() {
     if [ ${#PORT_RULES[@]} -eq 0 ]; then
         echo -e "  ${DIM}暂无规则${NC}"
     else
-        printf "  ${BOLD}%-8s %-7s %-10s %-12s %-12s %-12s %-10s${NC}\n" \
-            "端口" "协议" "限速至" "触发带宽" "触发持续" "限速时长" "当前状态"
-        echo "  ─────────────────────────────────────────────────────────────────"
+        printf "  ${BOLD}%-8s %-6s %-10s %-10s %-10s %-10s %-10s %-16s${NC}\n" \
+            "端口" "协议" "1级速率" "2级速率" "触发带宽" "触发持续" "2级时长" "当前状态"
+        echo "  ───────────────────────────────────────────────────────────────────────"
 
         for key in "${!PORT_RULES[@]}"; do
             local val="${PORT_RULES[$key]}"
-            local rate trig_bw trig_dur limit_dur port proto
-            rate=$(     echo "$val" | awk '{print $1}')
-            trig_bw=$(  echo "$val" | awk '{print $2}')
-            trig_dur=$( echo "$val" | awk '{print $3}')
-            limit_dur=$(echo "$val" | awk '{print $4}')
+            local rate1 rate2 trig_bw trig_dur limit_dur port proto
+            rate1=$(    echo "$val" | awk '{print $1}')
+            rate2=$(    echo "$val" | awk '{print $2}')
+            trig_bw=$(  echo "$val" | awk '{print $3}')
+            trig_dur=$( echo "$val" | awk '{print $4}')
+            limit_dur=$(echo "$val" | awk '{print $5}')
             port=$( echo "$key" | cut -d: -f1)
             proto=$(echo "$key" | cut -d: -f2)
 
@@ -647,25 +657,26 @@ show_rules() {
             local status; status=$(cat "${sdir}/status" 2>/dev/null || echo "—")
             local status_str
             case "$status" in
-                limited)
+                level1)
+                    status_str="${GREEN}●1级 ${rate1}${NC}"
+                    ;;
+                level2)
                     local lu; lu=$(cat "${sdir}/limit_until" 2>/dev/null || echo 0)
                     if [ "$lu" -gt 0 ] 2>/dev/null; then
                         local remain=$(( lu - $(date +%s) ))
                         [ "$remain" -lt 0 ] && remain=0
-                        status_str="${RED}限速中${NC} $(format_duration "$remain")"
+                        status_str="${RED}●2级 ${rate2}${NC} 剩余$(format_duration "$remain")"
                     else
-                        status_str="${RED}限速中(永久)${NC}"
+                        status_str="${RED}●2级 ${rate2}${NC} ${DIM}[永久]${NC}"
                     fi
                     ;;
-                normal) status_str="${GREEN}正常监控${NC}" ;;
-                *)      status_str="${DIM}未启动${NC}" ;;
+                *) status_str="${DIM}未启动${NC}" ;;
             esac
 
-            local trig_str; trig_str="${trig_bw}Mbps"
-            local ldur_str; ldur_str=$(format_duration "${limit_dur:-0}")
-
-            printf "  %-8s %-7s %-10s %-12s %-12s %-12s " \
-                "$port" "$proto" "$rate" "$trig_str" "$(format_duration "$trig_dur")" "$ldur_str"
+            printf "  %-8s %-6s %-10s %-10s %-10s %-10s %-10s " \
+                "$port" "$proto" "$rate1" "$rate2" \
+                "${trig_bw}Mbps" "$(format_duration "$trig_dur")" \
+                "$(format_duration "${limit_dur:-0}")"
             echo -e "$status_str"
         done
     fi
@@ -678,7 +689,7 @@ show_rules() {
             echo -e "  开机自启: ${DIM}未启用${NC}"
         fi
     fi
-    echo -e "${BOLD}${CYAN}══════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}${CYAN}══════════════════════════════════════════════════════════════════════${NC}"
     echo ""
 }
 
@@ -690,12 +701,12 @@ interactive_add() {
     local old_val=""
     [ -n "$edit_key" ] && old_val="${PORT_RULES[$edit_key]}"
 
-    # 解析旧值（修改模式用）
-    local old_rate old_tbw old_tdur old_ldur
-    old_rate=$(echo "$old_val" | awk '{print $1}')
-    old_tbw=$( echo "$old_val" | awk '{print $2}')
-    old_tdur=$(echo "$old_val" | awk '{print $3}')
-    old_ldur=$(echo "$old_val" | awk '{print $4}')
+    local old_rate1 old_rate2 old_tbw old_tdur old_ldur
+    old_rate1=$(echo "$old_val" | awk '{print $1}')
+    old_rate2=$(echo "$old_val" | awk '{print $2}')
+    old_tbw=$( echo "$old_val" | awk '{print $3}')
+    old_tdur=$(echo "$old_val" | awk '{print $4}')
+    old_ldur=$(echo "$old_val" | awk '{print $5}')
 
     echo ""
     echo -e "${BOLD}${BLUE}┌────────────────────────────────────────────────────────────────┐${NC}"
@@ -703,13 +714,13 @@ interactive_add() {
         local ep ep_proto
         ep=$(    echo "$edit_key" | cut -d: -f1)
         ep_proto=$(echo "$edit_key" | cut -d: -f2)
-        echo -e "${BOLD}${BLUE}│  修改端口限速规则                                              │${NC}"
+        echo -e "${BOLD}${BLUE}│  修改端口两级限速规则                                          │${NC}"
         echo -e "${BOLD}${BLUE}├────────────────────────────────────────────────────────────────┤${NC}"
-        echo -e "  当前值: 端口 ${BOLD}${ep}${NC}(${ep_proto})  限速 ${BOLD}${old_rate}${NC}  触发 ${BOLD}${old_tbw} Mbps${NC} / ${BOLD}$(format_duration "$old_tdur")${NC}  限速时长 ${BOLD}$(format_duration "$old_ldur")${NC}"
+        echo -e "  当前: 端口 ${BOLD}${ep}${NC}(${ep_proto})  1级 ${BOLD}${old_rate1}${NC}  2级 ${BOLD}${old_rate2}${NC}  触发 ${BOLD}${old_tbw}Mbps${NC}/$(format_duration "$old_tdur")  2级时长 $(format_duration "$old_ldur")"
     else
-        echo -e "${BOLD}${BLUE}│  添加端口限速规则                                              │${NC}"
+        echo -e "${BOLD}${BLUE}│  添加端口两级限速规则                                          │${NC}"
         echo -e "${BOLD}${BLUE}├────────────────────────────────────────────────────────────────┤${NC}"
-        echo -e "  ${DIM}说明: 当端口流量持续超过触发阈值，自动限速；限速到期后继续监控${NC}"
+        echo -e "  ${DIM}1级: 始终生效的基础限速；2级: 触发条件满足后自动降速，到期恢复1级${NC}"
     fi
     echo -e "${BOLD}${BLUE}└────────────────────────────────────────────────────────────────┘${NC}"
     echo ""
@@ -736,17 +747,30 @@ interactive_add() {
         echo -e "  ${BOLD}② 协议${NC}  →  ${BOLD}${proto}${NC}  （修改模式不可更改）"
     else
         echo -e "  ${BOLD}② 协议${NC}"
-        echo "     1) TCP      （仅 TCP 流量）"
-        echo "     2) UDP      （仅 UDP 流量）"
-        echo "     3) TCP+UDP  （全部流量，推荐）"
+        echo "     1) TCP      2) UDP      3) TCP+UDP（推荐）"
         read -rp "     选择 [默认: 1=TCP]: " pc
         case "${pc:-1}" in 2) proto="udp";; 3) proto="both";; *) proto="tcp";; esac
         echo -e "     已选: ${BOLD}${proto}${NC}"
     fi
 
-    # ── ③ 触发带宽阈值 ──────────────────────────────────
+    # ── ③ 1级速率（基础限速，始终生效）────────────────
     echo ""
-    echo -e "  ${BOLD}③ 触发带宽阈值${NC}  ${DIM}[ 单位: Mbps，接口总带宽超过此值开始计时 ]${NC}"
+    echo -e "  ${BOLD}③ 1级速率${NC}  ${DIM}[ 端口始终以此速率运行，监控启动后立即生效 ]${NC}"
+    echo -e "     ${DIM}格式: kbit / mbit / gbit，如 30mbit  100mbit  1gbit${NC}"
+    [ -n "$old_rate1" ] && echo -e "     ${DIM}当前值: ${old_rate1}${NC}"
+    local rate1 default_r1="${old_rate1:-30mbit}"
+    while true; do
+        read -rp "     1级速率 [默认: ${default_r1}，直接回车]: " rate1
+        [ -z "$rate1" ] && rate1="$default_r1" && break
+        [[ "${rate1,,}" =~ ^[0-9]+(kbit|mbit|gbit|kbps|mbps|gbps|bps)$ ]] && break
+        err "格式无效，示例: 30mbit  500kbit  1gbit"
+    done
+    rate1="${rate1,,}"
+    echo -e "     已设: ${BOLD}${rate1}${NC}"
+
+    # ── ④ 触发带宽阈值 ──────────────────────────────────
+    echo ""
+    echo -e "  ${BOLD}④ 触发带宽阈值${NC}  ${DIM}[ 接口上行带宽超过此值时开始计时，单位 Mbps ]${NC}"
     [ -n "$old_tbw" ] && echo -e "     ${DIM}当前值: ${old_tbw} Mbps${NC}"
     local trig_bw default_tbw="${old_tbw:-80}"
     while true; do
@@ -757,75 +781,72 @@ interactive_add() {
     done
     echo -e "     已设: ${BOLD}${trig_bw} Mbps${NC}"
 
-    # ── ④ 触发持续时间 ──────────────────────────────────
+    # ── ⑤ 触发持续时间 ──────────────────────────────────
     echo ""
-    echo -e "  ${BOLD}④ 触发持续时间${NC}  ${DIM}[ 带宽持续超过阈值多久后才触发限速 ]${NC}"
+    echo -e "  ${BOLD}⑤ 触发持续时间${NC}  ${DIM}[ 带宽持续超过阈值多久后降至 2级 ]${NC}"
     echo -e "     ${DIM}格式: 秒=s / 分=m / 时=h，如 300s  5m  1h${NC}"
     [ -n "$old_tdur" ] && echo -e "     ${DIM}当前值: $(format_duration "$old_tdur")（${old_tdur} 秒）${NC}"
     local trig_dur default_tdur="${old_tdur:-300}"
     while true; do
         read -rp "     持续时间 [默认: $(format_duration "$default_tdur")（${default_tdur} 秒），直接回车]: " tdi
-        if [ -z "$tdi" ]; then
-            trig_dur="$default_tdur"; break
-        fi
+        if [ -z "$tdi" ]; then trig_dur="$default_tdur"; break; fi
         trig_dur=$(parse_duration "$tdi")
         [ "$trig_dur" != "-1" ] && [ "$trig_dur" -gt 0 ] && break
-        err "格式无效或不能为 0，示例: 300s  5m  1h"
+        err "格式无效或不能为 0，示例: 5m  300s"
     done
     echo -e "     已设: ${BOLD}$(format_duration "$trig_dur")（${trig_dur} 秒）${NC}"
 
-    # ── ⑤ 限速至（触发后的速率上限）────────────────────
+    # ── ⑥ 2级速率（触发后降速）────────────────────────
     echo ""
-    echo -e "  ${BOLD}⑤ 限速至${NC}  ${DIM}[ 触发后将带宽限制到此速率 ]${NC}"
-    echo -e "     ${DIM}格式: kbit / mbit / gbit，如 512kbit  10mbit  1gbit${NC}"
-    [ -n "$old_rate" ] && echo -e "     ${DIM}当前值: ${old_rate}${NC}"
-    local rate default_rate="${old_rate:-10mbit}"
+    echo -e "  ${BOLD}⑥ 2级速率${NC}  ${DIM}[ 触发后降至此速率，应低于1级速率 ${rate1} ]${NC}"
+    echo -e "     ${DIM}格式: kbit / mbit / gbit，如 5mbit  512kbit${NC}"
+    [ -n "$old_rate2" ] && echo -e "     ${DIM}当前值: ${old_rate2}${NC}"
+    local rate2 default_r2="${old_rate2:-5mbit}"
     while true; do
-        read -rp "     限速值 [默认: ${default_rate}，直接回车]: " rate
-        [ -z "$rate" ] && rate="$default_rate" && break
-        [[ "${rate,,}" =~ ^[0-9]+(kbit|mbit|gbit|kbps|mbps|gbps|bps)$ ]] && break
-        err "格式无效，示例: 512kbit  10mbit  1gbit"
+        read -rp "     2级速率 [默认: ${default_r2}，直接回车]: " rate2
+        [ -z "$rate2" ] && rate2="$default_r2" && break
+        [[ "${rate2,,}" =~ ^[0-9]+(kbit|mbit|gbit|kbps|mbps|gbps|bps)$ ]] && break
+        err "格式无效，示例: 5mbit  512kbit"
     done
-    rate="${rate,,}"
-    echo -e "     已设: ${BOLD}${rate}${NC}"
+    rate2="${rate2,,}"
+    echo -e "     已设: ${BOLD}${rate2}${NC}"
 
-    # ── ⑥ 限速时长 ──────────────────────────────────────
+    # ── ⑦ 2级限速时长 ──────────────────────────────────
     echo ""
-    echo -e "  ${BOLD}⑥ 限速时长${NC}  ${DIM}[ 触发后限速持续多久，到期自动解除并继续监控 ]${NC}"
-    echo -e "     ${DIM}格式: 秒=s / 分=m / 时=h，0 或直接回车=永久（需手动解除）${NC}"
+    echo -e "  ${BOLD}⑦ 2级限速时长${NC}  ${DIM}[ 2级持续多久后自动恢复 1级 ${rate1}，可循环触发 ]${NC}"
+    echo -e "     ${DIM}格式: 秒=s / 分=m / 时=h，0=永久（需手动恢复）${NC}"
     [ -n "$old_ldur" ] && echo -e "     ${DIM}当前值: $(format_duration "$old_ldur")（${old_ldur} 秒）${NC}"
     local limit_dur default_ldur="${old_ldur:-0}"
     while true; do
         if [ "$default_ldur" -eq 0 ] 2>/dev/null; then
-            read -rp "     限速时长 [默认: 永久，直接回车]: " ldi
+            read -rp "     2级时长 [默认: 永久，直接回车]: " ldi
         else
-            read -rp "     限速时长 [默认: $(format_duration "$default_ldur")（${default_ldur} 秒），直接回车]: " ldi
+            read -rp "     2级时长 [默认: $(format_duration "$default_ldur")（${default_ldur} 秒），直接回车]: " ldi
         fi
-        if [ -z "$ldi" ]; then
-            limit_dur="$default_ldur"; break
-        fi
+        if [ -z "$ldi" ]; then limit_dur="$default_ldur"; break; fi
         limit_dur=$(parse_duration "$ldi")
         [ "$limit_dur" != "-1" ] && break
         err "格式无效，示例: 20m  1h  0=永久"
     done
     if [ "$limit_dur" -eq 0 ] 2>/dev/null; then
-        echo -e "     已设: ${BOLD}永久${NC}  ${DIM}（需手动解除）${NC}"
+        echo -e "     已设: ${BOLD}永久${NC}  ${DIM}（需手动恢复1级）${NC}"
     else
         echo -e "     已设: ${BOLD}$(format_duration "$limit_dur")（${limit_dur} 秒）${NC}"
     fi
 
     # ── 确认汇总 ─────────────────────────────────────────
     echo ""
-    echo -e "  ${BOLD}${CYAN}┌── 规则确认 ──────────────────────────────────────────────────┐${NC}"
+    echo -e "  ${BOLD}${CYAN}┌── 规则确认 ────────────────────────────────────────────────────┐${NC}"
     echo -e "  ${BOLD}${CYAN}│${NC}  端口: ${BOLD}${port}${NC}  协议: ${BOLD}${proto}${NC}"
-    echo -e "  ${BOLD}${CYAN}│${NC}  当 ${INTERFACE} 接口带宽 > ${BOLD}${trig_bw} Mbps${NC} 持续 ${BOLD}$(format_duration "$trig_dur")（${trig_dur}秒）${NC}"
-    echo -e "  ${BOLD}${CYAN}│${NC}  → 自动限速至 ${BOLD}${rate}${NC}"
+    echo -e "  ${BOLD}${CYAN}│${NC}  ${GREEN}1级${NC}: 始终限速至 ${BOLD}${rate1}${NC}（监控启动即生效）"
+    echo -e "  ${BOLD}${CYAN}│${NC}  触发: 上行带宽 > ${BOLD}${trig_bw} Mbps${NC} 持续 ${BOLD}$(format_duration "$trig_dur")${NC}"
+    echo -e "  ${BOLD}${CYAN}│${NC}  ${RED}2级${NC}: 降速至 ${BOLD}${rate2}${NC}"
     if [ "$limit_dur" -gt 0 ] 2>/dev/null; then
-        echo -e "  ${BOLD}${CYAN}│${NC}  → 限速 ${BOLD}$(format_duration "$limit_dur")（${limit_dur}秒）${NC} 后自动解除，恢复监控（可循环）"
+        echo -e "  ${BOLD}${CYAN}│${NC}  ${BOLD}$(format_duration "$limit_dur")${NC} 后自动恢复 ${GREEN}1级 ${rate1}${NC}，继续监控（可循环）"
     else
-        echo -e "  ${BOLD}${CYAN}│${NC}  → ${BOLD}永久限速${NC}，需从菜单手动解除"
+        echo -e "  ${BOLD}${CYAN}│${NC}  永久2级，需手动从菜单恢复1级"
     fi
-    echo -e "  ${BOLD}${CYAN}└──────────────────────────────────────────────────────────────┘${NC}"
+    echo -e "  ${BOLD}${CYAN}└────────────────────────────────────────────────────────────────┘${NC}"
     echo ""
     read -rp "  确认保存? [Y/n]: " confirm
     [[ "${confirm:-Y}" =~ ^[Yy]$ ]] || { warn "已取消"; return; }
@@ -833,9 +854,9 @@ interactive_add() {
     local new_key="${port}:${proto}"
     [ -n "$edit_key" ] && [ "$edit_key" != "$new_key" ] && unset "PORT_RULES[$edit_key]"
 
-    PORT_RULES["$new_key"]="${rate} ${trig_bw} ${trig_dur} ${limit_dur}"
+    PORT_RULES["$new_key"]="${rate1} ${rate2} ${trig_bw} ${trig_dur} ${limit_dur}"
     ok "规则已保存 ✓  （记得选「保存配置」写入磁盘）"
-    log "规则: 端口=$port 协议=$proto 限速=$rate 触发=${trig_bw}Mbps 持续=${trig_dur}s 限速时长=${limit_dur}s"
+    log "规则: 端口=$port 协议=$proto 1级=$rate1 2级=$rate2 触发=${trig_bw}Mbps 持续=${trig_dur}s 2级时长=${limit_dur}s"
     echo -e "${BOLD}${BLUE}└────────────────────────────────────────────────────────────────┘${NC}"
 }
 
@@ -846,12 +867,12 @@ interactive_edit() {
     local i=1; declare -a ekeys
     for key in "${!PORT_RULES[@]}"; do
         local val="${PORT_RULES[$key]}"
-        printf "  ${BOLD}%2d)${NC}  端口 %-6s 协议 %-6s → 限速 %-8s 触发 %sMbps/%-8s 限速时长 %s\n" \
+        printf "  ${BOLD}%2d)${NC}  端口 %-6s 协议 %-6s  1级 %-8s  2级 %-8s  触发 %sMbps/%-8s  2级时长 %s\n" \
             "$i" "$(echo $key|cut -d: -f1)" "$(echo $key|cut -d: -f2)" \
-            "$(echo $val|awk '{print $1}')" \
-            "$(echo $val|awk '{print $2}')" \
-            "$(format_duration "$(echo $val|awk '{print $3}')")" \
-            "$(format_duration "$(echo $val|awk '{print $4}')")"
+            "$(echo $val|awk '{print $1}')" "$(echo $val|awk '{print $2}')" \
+            "$(echo $val|awk '{print $3}')" \
+            "$(format_duration "$(echo $val|awk '{print $4}')")" \
+            "$(format_duration "$(echo $val|awk '{print $5}')")"
         ekeys+=("$key"); i=$(( i+1 ))
     done
     echo ""
@@ -868,9 +889,10 @@ interactive_delete() {
     local i=1; declare -a dkeys
     for key in "${!PORT_RULES[@]}"; do
         local val="${PORT_RULES[$key]}"
-        printf "  ${BOLD}%2d)${NC}  端口 %-6s 协议 %-6s → 限速 %-8s 触发 %sMbps\n" \
+        printf "  ${BOLD}%2d)${NC}  端口 %-6s 协议 %-6s  1级 %-8s  2级 %-8s  触发 %sMbps\n" \
             "$i" "$(echo $key|cut -d: -f1)" "$(echo $key|cut -d: -f2)" \
-            "$(echo $val|awk '{print $1}')" "$(echo $val|awk '{print $2}')"
+            "$(echo $val|awk '{print $1}')" "$(echo $val|awk '{print $2}')" \
+            "$(echo $val|awk '{print $3}')"
         dkeys+=("$key"); i=$(( i+1 ))
     done
     echo ""
@@ -984,25 +1006,42 @@ show_log() {
 # ─────────────────────────────────────────────────────────
 interactive_menu() {
     load_config
+
+    # 启动时静默检查更新（后台检测，有新版本时在菜单顶部提示）
+    local _update_available=false
+    local _remote_ver=""
+    _remote_ver=$(_remote_version "$QOS_UPDATE_URL" 2>/dev/null)
+    if [ -n "$_remote_ver" ] && _version_lt "$QOS_VERSION" "$_remote_ver"; then
+        _update_available=true
+    fi
+
     while true; do
         clear
         echo -e "${BOLD}${GREEN}"
-        echo "  ╔═════════════════════════════════════════════════════╗"
-        echo "             QoS 端口智能限速管理工具  v3.0                   "
-        echo "  ╚═════════════════════════════════════════════════════╝${NC}"
+        echo "  ╔════════════════════════════════════════════════════════════╗"
+        echo "  ║          QoS 端口智能限速管理工具  v${QOS_VERSION}                ║"
+        echo "  ╚════════════════════════════════════════════════════════════╝${NC}"
+
+        # 有新版本时顶部横幅提示
+        if $_update_available; then
+            echo -e "  ${BOLD}${YELLOW}┌─ 🔔 发现新版本 v${_remote_ver} ─────────────────────────────────────┐${NC}"
+            echo -e "  ${BOLD}${YELLOW}│  选择 'U) 在线更新' 即可一键升级                              │${NC}"
+            echo -e "  ${BOLD}${YELLOW}└────────────────────────────────────────────────────────────────┘${NC}"
+            echo ""
+        fi
 
         show_rules
 
         echo -e "  ${BOLD}规则管理${NC}"
         echo "  ──────────────────────────────────────────────────────────"
-        echo "  1) 添加端口触发限速规则"
-        echo "  2) 修改端口触发限速规则"
-        echo "  3) 删除端口触发限速规则"
+        echo "  1) 添加端口两级限速规则"
+        echo "  2) 修改端口两级限速规则"
+        echo "  3) 删除端口限速规则"
         echo "  ──────────────────────────────────────────────────────────"
         echo -e "  ${BOLD}监控控制${NC}"
-        echo "  4) 启动监控（开始自动检测并触发限速）"
+        echo "  4) 启动监控"
         echo "  5) 停止监控"
-        echo "  6) 手动解除某端口当前限速"
+        echo "  6) 手动恢复端口至 1级限速"
         echo "  ──────────────────────────────────────────────────────────"
         echo -e "  ${BOLD}配置与系统${NC}"
         echo "  7) 保存配置"
@@ -1014,6 +1053,12 @@ interactive_menu() {
         echo "  i) 安装/更新系统服务（开机自启）"
         echo "  u) 卸载系统服务"
         echo "  d) 重新检测/安装依赖"
+        if $_update_available; then
+            echo -e "  ${BOLD}${YELLOW}U) 在线更新 → v${_remote_ver}${NC}"
+        else
+            echo "  U) 检查在线更新"
+        fi
+        echo "  R) 清理旧配置并重新安装（保留规则）"
         echo "  0) 退出"
         echo "  ──────────────────────────────────────────────────────────"
         read -rp "  请选择: " choice
@@ -1034,8 +1079,23 @@ interactive_menu() {
             t|T) show_tc_status ;;
             l|L) show_log ;;
             i|I) save_config; install_service ;;
-            u|U) uninstall_service ;;
+            u|U_svc) uninstall_service ;;
+            u) uninstall_service ;;
             d|D) bootstrap_deps force ;;
+            U)
+                do_update
+                # do_update 成功后会 exit 0，失败则继续
+                ;;
+            R|r)
+                do_clean_reinstall
+                # 清理完重新检测更新状态
+                _remote_ver=$(_remote_version "$QOS_UPDATE_URL" 2>/dev/null)
+                if [ -n "$_remote_ver" ] && _version_lt "$QOS_VERSION" "$_remote_ver"; then
+                    _update_available=true
+                else
+                    _update_available=false
+                fi
+                ;;
             0) echo -e "\n${GREEN}  再见！${NC}\n"; exit 0 ;;
             *) err "无效选项: $choice" ;;
         esac
@@ -1043,6 +1103,211 @@ interactive_menu() {
         echo ""
         read -rp "  按 Enter 继续..." _
     done
+}
+
+# ─────────────────────────────────────────────────────────
+# 在线检测与更新
+# ─────────────────────────────────────────────────────────
+
+# 从远程脚本提取版本号（读取 QOS_VERSION="x.x.x" 那行）
+_remote_version() {
+    local url="$1"
+    if command -v curl &>/dev/null; then
+        curl -fsSL --connect-timeout 8 "$url" 2>/dev/null \
+            | grep -m1 '^QOS_VERSION=' | cut -d'"' -f2
+    elif command -v wget &>/dev/null; then
+        wget -qO- --timeout=8 "$url" 2>/dev/null \
+            | grep -m1 '^QOS_VERSION=' | cut -d'"' -f2
+    fi
+}
+
+# 版本比较：若 $1 < $2 返回 0（需要更新），否则返回 1
+_version_lt() {
+    [ "$(printf '%s\n' "$1" "$2" | sort -V | head -1)" != "$2" ]
+}
+
+check_update() {
+    local silent="${1:-}"   # 传 "silent" 则无更新时不输出
+
+    [ "$silent" != "silent" ] && echo ""
+    [ "$silent" != "silent" ] && info "正在检查更新..."
+
+    local remote_ver
+    remote_ver=$(_remote_version "$QOS_UPDATE_URL")
+
+    if [ -z "$remote_ver" ]; then
+        warn "无法获取远程版本，请检查网络或 curl/wget 是否安装"
+        return 1
+    fi
+
+    if _version_lt "$remote_ver" "$QOS_VERSION" || [ "$remote_ver" = "$QOS_VERSION" ]; then
+        # 已是最新
+        [ "$silent" != "silent" ] && ok "当前已是最新版本 ${BOLD}v${QOS_VERSION}${NC}"
+        return 1   # 返回1=不需要更新
+    fi
+
+    # 有新版本
+    echo ""
+    echo -e "${BOLD}${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${BOLD}${YELLOW}  发现新版本！${NC}"
+    echo -e "  当前版本: ${DIM}v${QOS_VERSION}${NC}"
+    echo -e "  最新版本: ${BOLD}${GREEN}v${remote_ver}${NC}"
+    echo -e "${BOLD}${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    return 0   # 返回0=有新版本
+}
+
+do_update() {
+    require_root
+    echo ""
+    echo -e "${BOLD}${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${BOLD}${CYAN}              在线更新 QoS 脚本                     ${NC}"
+    echo -e "${BOLD}${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+
+    local remote_ver
+    remote_ver=$(_remote_version "$QOS_UPDATE_URL")
+    if [ -z "$remote_ver" ]; then
+        err "无法获取远程版本，请检查网络"; return 1
+    fi
+
+    if _version_lt "$remote_ver" "$QOS_VERSION" || [ "$remote_ver" = "$QOS_VERSION" ]; then
+        ok "当前已是最新版本 v${QOS_VERSION}，无需更新"
+        return 0
+    fi
+
+    echo -e "  当前: ${DIM}v${QOS_VERSION}${NC}  →  最新: ${BOLD}${GREEN}v${remote_ver}${NC}"
+    echo ""
+    read -rp "  确认更新? [Y/n]: " confirm
+    [[ "${confirm:-Y}" =~ ^[Yy]$ ]] || { warn "已取消"; return; }
+
+    # 下载新版本到临时文件
+    local tmp; tmp=$(mktemp /tmp/qos_update.XXXXXX)
+    step "下载新版本..."
+    local dl_ok=false
+    if command -v curl &>/dev/null; then
+        curl -fsSL --connect-timeout 15 "$QOS_UPDATE_URL" -o "$tmp" 2>/dev/null && dl_ok=true
+    elif command -v wget &>/dev/null; then
+        wget -qO "$tmp" --timeout=15 "$QOS_UPDATE_URL" 2>/dev/null && dl_ok=true
+    fi
+
+    if ! $dl_ok || [ ! -s "$tmp" ]; then
+        err "下载失败，请检查网络"; rm -f "$tmp"; return 1
+    fi
+
+    # 验证下载的是合法 bash 脚本
+    if ! bash -n "$tmp" 2>/dev/null; then
+        err "下载文件校验失败（语法错误），更新中止"; rm -f "$tmp"; return 1
+    fi
+
+    # 备份当前版本
+    cp -f "$QOS_BIN" "${QOS_BIN}.bak" 2>/dev/null && \
+        ok "已备份当前版本 → ${QOS_BIN}.bak"
+
+    # 替换
+    cp -f "$tmp" "$QOS_BIN"
+    chmod +x "$QOS_BIN"
+    sed -i 's/\r//' "$QOS_BIN" 2>/dev/null || true
+    rm -f "$tmp"
+
+    ok "更新完成！${DIM}v${QOS_VERSION}${NC} → ${BOLD}${GREEN}v${remote_ver}${NC}"
+    log "脚本更新: v${QOS_VERSION} → v${remote_ver}"
+
+    # 重启监控服务使新版本生效
+    echo ""
+    step "重启监控服务使新版本生效..."
+    stop_monitor 2>/dev/null
+    sleep 1
+    load_config
+    start_monitor
+    ok "监控服务已用新版本重启 ✓"
+    echo ""
+    echo -e "${BOLD}${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "  更新完成，请重新执行 ${BOLD}qos${NC} 进入新版本菜单"
+    echo -e "${BOLD}${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    exit 0
+}
+
+# ─────────────────────────────────────────────────────────
+# 清理旧配置并重新安装（保留规则配置文件）
+# ─────────────────────────────────────────────────────────
+do_clean_reinstall() {
+    require_root
+    echo ""
+    echo -e "${BOLD}${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${BOLD}${RED}          清理旧配置并重新安装                      ${NC}"
+    echo -e "${BOLD}${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    echo -e "  ${BOLD}此操作将:${NC}"
+    echo -e "  ${RED}•${NC} 停止监控守护进程"
+    echo -e "  ${RED}•${NC} 清除所有 TC 限速规则和 iptables mark 规则"
+    echo -e "  ${RED}•${NC} 删除运行时状态文件 (/run/qos/)"
+    echo -e "  ${RED}•${NC} 删除依赖初始化标记（重新检测依赖）"
+    echo -e "  ${GREEN}•${NC} ${BOLD}保留${NC} 端口规则配置文件 ($CONFIG_FILE)"
+    echo -e "  ${GREEN}•${NC} 重新安装脚本和 systemd 服务"
+    echo ""
+    read -rp "  确认执行? [y/N]: " confirm
+    [[ "${confirm}" =~ ^[Yy]$ ]] || { warn "已取消"; return; }
+
+    echo ""
+
+    # 1. 停止监控
+    step "停止监控守护进程..."
+    stop_monitor 2>/dev/null; sleep 1
+
+    # 2. 清除 TC 和 iptables 规则
+    step "清除 TC 和 iptables mark 规则..."
+    load_config
+    local h=10
+    for key in "${!PORT_RULES[@]}"; do
+        local port proto
+        port=$(echo "$key" | cut -d: -f1)
+        proto=$(echo "$key" | cut -d: -f2)
+        _ipt_clear_port "$port" "$proto" "$h" 2>/dev/null || true
+        h=$(( h + 10 ))
+    done
+    tc qdisc del dev "$INTERFACE" root 2>/dev/null || true
+    ok "TC / iptables 规则已清除"
+
+    # 3. 清除运行时状态
+    step "清除运行时状态文件..."
+    rm -rf /run/qos
+    mkdir -p /run/qos
+    ok "状态文件已清除"
+
+    # 4. 清除依赖初始化标记（让 bootstrap 重新检测）
+    step "清除依赖初始化标记..."
+    rm -f "$FIRST_RUN_FLAG"
+    ok "初始化标记已清除"
+
+    # 5. 重新安装脚本
+    step "重新安装脚本到 ${QOS_BIN}..."
+    cp -f "$SCRIPT_SELF" "$QOS_BIN" 2>/dev/null || cp -f "$0" "$QOS_BIN"
+    chmod +x "$QOS_BIN"
+    sed -i 's/\r//' "$QOS_BIN" 2>/dev/null || true
+    ok "脚本已重新安装 → ${QOS_BIN}"
+
+    # 6. 重新检测依赖
+    echo ""
+    bootstrap_deps
+
+    # 7. 重新注册 systemd 服务
+    echo ""
+    step "重新注册 systemd 服务..."
+    load_config
+    install_service
+
+    # 8. 重新启动监控
+    echo ""
+    step "重新启动监控..."
+    start_monitor
+
+    echo ""
+    echo -e "${BOLD}${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    ok "清理重装完成！端口规则配置已保留，监控已重新启动"
+    echo -e "${BOLD}${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    log "清理重装完成"
 }
 
 # ─────────────────────────────────────────────────────────
@@ -1096,19 +1361,22 @@ usage() {
     echo -e "${BOLD}用法:${NC}  qos [命令]"
     echo ""
     echo -e "  ${BOLD}命令:${NC}"
-    printf "  %-38s %s\n" "(无参数)"                   "进入交互式菜单"
-    printf "  %-38s %s\n" "setup"                      "首次安装：注册 qos 快捷命令 + 依赖 + 自启"
-    printf "  %-38s %s\n" "start"                      "启动监控守护进程"
-    printf "  %-38s %s\n" "stop"                       "停止监控守护进程"
-    printf "  %-38s %s\n" "status"                     "显示规则与监控状态"
-    printf "  %-38s %s\n" "clear"                      "清除所有 TC 规则"
-    printf "  %-38s %s\n" "install"                    "安装 systemd 服务（开机自启）"
-    printf "  %-38s %s\n" "uninstall"                  "卸载系统服务"
-    printf "  %-38s %s\n" "check-deps"                 "强制检测并安装依赖"
-    printf "  %-38s %s\n" "_monitor"                   "（内部）监控守护进程主循环"
-    printf "  %-38s %s\n" "help"                       "显示此帮助"
+    printf "  %-38s %s\n" "(无参数)"       "进入交互式菜单"
+    printf "  %-38s %s\n" "setup"          "首次安装：注册 qos 快捷命令 + 依赖 + 自启"
+    printf "  %-38s %s\n" "update"         "检测并在线更新到最新版本"
+    printf "  %-38s %s\n" "reinstall"      "清理旧配置并重新安装（保留规则）"
+    printf "  %-38s %s\n" "start"          "启动监控守护进程"
+    printf "  %-38s %s\n" "stop"           "停止监控守护进程"
+    printf "  %-38s %s\n" "status"         "显示规则与监控状态"
+    printf "  %-38s %s\n" "clear"          "清除所有 TC 规则"
+    printf "  %-38s %s\n" "install"        "安装 systemd 服务（开机自启）"
+    printf "  %-38s %s\n" "uninstall"      "卸载系统服务"
+    printf "  %-38s %s\n" "check-deps"     "强制检测并安装依赖"
+    printf "  %-38s %s\n" "_monitor"       "（内部）监控守护进程主循环"
+    printf "  %-38s %s\n" "help"           "显示此帮助"
     echo ""
     echo -e "  ${BOLD}时长格式:${NC}  30s  5m  2h  1d  1h30m  90（=90分钟）  0=永久"
+    echo -e "  ${BOLD}当前版本:${NC}  v${QOS_VERSION}"
     echo ""
 }
 
@@ -1118,6 +1386,10 @@ usage() {
 case "${1:-}" in
     setup)
         do_setup ;;
+    update)
+        do_update ;;
+    reinstall)
+        do_clean_reinstall ;;
     start)
         require_root; bootstrap_deps; load_config; start_monitor ;;
     stop)
@@ -1127,7 +1399,6 @@ case "${1:-}" in
     clear)
         require_root; load_config; clear_rules ;;
     _monitor)
-        # 内部调用：守护进程主循环
         monitor_daemon ;;
     install)
         require_root; load_config; install_service ;;
