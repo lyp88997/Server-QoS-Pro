@@ -32,8 +32,13 @@ wget -O qos.sh [https://raw.githubusercontent.com/lyp88997/Server-QoS-Pro/refs/h
 
 2. 快捷指令
 安装完成后，你可以在任何位置直接输入以下快捷命令：
-#• qos - 进入交互式管理主菜单
-#• qos start - 启动后台监控进程
-#• qos stop - 停止后台监控进程
-#• qos status - 查看当前所有端口的实时监控与限速状态
-#• qos clear - 一键强制清除所有流量控制规则
+
+• qos - 进入交互式管理主菜单
+
+• qos start - 启动后台监控进程
+
+• qos stop - 停止后台监控进程
+
+• qos status - 查看当前所有端口的实时监控与限速状态
+
+• qos clear - 一键强制清除所有流量控制规则
