@@ -23,7 +23,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
 SCRIPT_SELF="$(realpath "$0" 2>/dev/null || readlink -f "$0")"
 QOS_BIN="/usr/bin/qos"
-QOS_VERSION="3.1.4"
+QOS_VERSION="3.1.5"
 QOS_UPDATE_URL="https://raw.githubusercontent.com/lyp88997/Server-QoS-Pro/refs/heads/main/qos.sh"
 
 _is_internal_cmd() {
@@ -729,103 +729,153 @@ unlimit_port_now() {
 # 显示规则状态
 # ─────────────────────────────────────────────────────────
 show_rules() {
-    local W=70
-    local line; printf -v line '%*s' "$W" ''; line="${line// /-}"
+    # ── 宽度常量 ────────────────────────────────────────────
+    local W=62
+    local HL; printf -v HL '%*s' "$W" ''; HL="${HL// /-}"
+    local HL2; printf -v HL2 '%*s' $(( W - 4 )) ''; HL2="${HL2// /-}"
 
+    # ════════════════════════════════════════════════════════
+    # 区域一：系统状态
+    # ════════════════════════════════════════════════════════
     printf "\n"
-    printf "${BOLD}${CYAN}+%s+${NC}\n" "$line"
-    printf "${BOLD}${CYAN}|  %-*s|${NC}\n" $(( W - 1 )) "QoS 端口限速 v${QOS_VERSION} -- 当前规则"
-    printf "${BOLD}${CYAN}+%s+${NC}\n" "$line"
-    printf "  接口: ${BOLD}%s${NC}    采样间隔: %ss\n" "$INTERFACE" "$MONITOR_INTERVAL"
-    printf "\n"
-    monitor_status
-    printf "\n"
+    printf "${BOLD}${CYAN}+%s+${NC}\n" "$HL"
+    printf "${BOLD}${CYAN}|${NC}  ${BOLD}%-*s${NC}${BOLD}${CYAN}|${NC}\n" $(( W - 1 )) "区域一  系统状态"
+    printf "${BOLD}${CYAN}+%s+${NC}\n" "$HL"
 
-    if [ ${#PORT_RULES[@]} -eq 0 ]; then
-        printf "  ${DIM}暂无规则${NC}\n"
+    # 监控进程
+    local pid_file="${STATE_DIR}/monitor.pid"
+    local mon_str
+    if [ -f "$pid_file" ]; then
+        local _pid; _pid=$(cat "$pid_file")
+        if kill -0 "$_pid" 2>/dev/null; then
+            mon_str="${GREEN}● 运行中${NC}  PID=${BOLD}${_pid}${NC}"
+        else
+            mon_str="${RED}● 已停止${NC}  ${DIM}(PID文件残留)${NC}"
+        fi
     else
-        printf "  ${BOLD}%-7s %-5s %-9s %-9s %-9s %-9s %-9s %-4s  %-16s${NC}\n" \
-            "端口" "协议" "1级速率" "2级速率" "触发带宽" "触发持续" "2级时长" "2级" "当前状态"
-        printf "  %s\n" "$(printf '%0.s-' {1..80})"
-
-        for key in "${!PORT_RULES[@]}"; do
-            local val="${PORT_RULES[$key]}"
-            local rate1 rate2 trig_bw trig_dur limit_dur l2_en port proto
-            rate1=$(    echo "$val" | awk '{print $1}')
-            rate2=$(    echo "$val" | awk '{print $2}')
-            trig_bw=$(  echo "$val" | awk '{print $3}')
-            trig_dur=$( echo "$val" | awk '{print $4}')
-            limit_dur=$(echo "$val" | awk '{print $5}')
-            l2_en=$(    echo "$val" | awk '{print $6}')
-            [ -z "$l2_en" ] && l2_en="1"   # 旧配置无第6字段默认开启
-            port=$( echo "$key" | cut -d: -f1)
-            proto=$(echo "$key" | cut -d: -f2)
-
-            local sdir="${STATE_DIR}/${key//:/_}"
-            local status; status=$(cat "${sdir}/status" 2>/dev/null || echo "-")
-
-            # 2级开关标识
-            local l2_str
-            if [ "$l2_en" = "1" ]; then
-                l2_str="${GREEN}ON${NC}"
-            else
-                l2_str="${DIM}OFF${NC}"
-            fi
-
-            # 当前状态
-            local status_str
-            if [ "$l2_en" = "0" ]; then
-                case "$status" in
-                    level1) status_str="${GREEN}限速中 ${rate1}${NC}" ;;
-                    *)      status_str="${DIM}未启动${NC}" ;;
-                esac
-            else
-                case "$status" in
-                    level1)
-                        status_str="${GREEN}1级 ${rate1}${NC}"
-                        ;;
-                    level2)
-                        local lu; lu=$(cat "${sdir}/limit_until" 2>/dev/null || echo 0)
-                        if [ "$lu" -gt 0 ] 2>/dev/null; then
-                            local remain=$(( lu - $(date +%s) ))
-                            [ "$remain" -lt 0 ] && remain=0
-                            status_str="${RED}2级 ${rate2}${NC} ${DIM}剩$(format_duration "$remain")${NC}"
-                        else
-                            status_str="${RED}2级 ${rate2} [永久]${NC}"
-                        fi
-                        ;;
-                    *) status_str="${DIM}未启动${NC}" ;;
-                esac
-            fi
-
-            # 2级关闭时，2级相关字段显示 -
-            local r2_disp trig_bw_disp trig_dur_disp ldur_disp
-            if [ "$l2_en" = "0" ]; then
-                r2_disp="-"; trig_bw_disp="-"; trig_dur_disp="-"; ldur_disp="-"
-            else
-                r2_disp="$rate2"
-                trig_bw_disp="${trig_bw}Mbps"
-                trig_dur_disp="$(format_duration "$trig_dur")"
-                ldur_disp="$(format_duration "${limit_dur:-0}")"
-            fi
-
-            printf "  %-7s %-5s %-9s %-9s %-9s %-9s %-9s " \
-                "$port" "$proto" "$rate1" "$r2_disp" \
-                "$trig_bw_disp" "$trig_dur_disp" "$ldur_disp"
-            printf "${l2_str}    ${status_str}\n"
-        done
+        mon_str="${DIM}● 未运行${NC}"
     fi
 
-    printf "\n"
+    # 开机自启
+    local boot_str="${DIM}未配置${NC}"
     if command -v systemctl &>/dev/null; then
         if systemctl is-enabled qos &>/dev/null 2>&1; then
-            printf "  开机自启: ${GREEN}已启用${NC}\n"
+            boot_str="${GREEN}已启用${NC}"
         else
-            printf "  开机自启: ${DIM}未启用${NC}\n"
+            boot_str="${YELLOW}未启用${NC}"
         fi
     fi
-    printf "${BOLD}${CYAN}+%s+${NC}\n\n" "$line"
+
+    printf "${BOLD}${CYAN}|${NC}  %-14s %b\n" "监控进程:" "$mon_str"
+    printf "${BOLD}${CYAN}|${NC}  %-14s ${BOLD}%s${NC}\n" "网络接口:" "$INTERFACE"
+    printf "${BOLD}${CYAN}|${NC}  %-14s ${BOLD}%s${NC}s\n" "采样间隔:" "$MONITOR_INTERVAL"
+    printf "${BOLD}${CYAN}|${NC}  %-14s %b\n" "开机自启:" "$boot_str"
+    printf "${BOLD}${CYAN}+%s+${NC}\n" "$HL"
+
+    # ════════════════════════════════════════════════════════
+    # 区域二：端口规则
+    # ════════════════════════════════════════════════════════
+    printf "\n"
+    printf "${BOLD}${CYAN}+%s+${NC}\n" "$HL"
+    printf "${BOLD}${CYAN}|${NC}  ${BOLD}%-*s${NC}${BOLD}${CYAN}|${NC}\n" $(( W - 1 )) "区域二  端口限速规则"
+    printf "${BOLD}${CYAN}+%s+${NC}\n" "$HL"
+
+    if [ ${#PORT_RULES[@]} -eq 0 ]; then
+        printf "${BOLD}${CYAN}|${NC}  ${DIM}暂无规则，请选择 1) 添加规则${NC}\n"
+        printf "${BOLD}${CYAN}+%s+${NC}\n\n" "$HL"
+        return
+    fi
+
+    local idx=0
+    for key in "${!PORT_RULES[@]}"; do
+        idx=$(( idx + 1 ))
+        local val="${PORT_RULES[$key]}"
+        local rate1 rate2 trig_bw trig_dur limit_dur l2_en port proto
+        rate1=$(    echo "$val" | awk '{print $1}')
+        rate2=$(    echo "$val" | awk '{print $2}')
+        trig_bw=$(  echo "$val" | awk '{print $3}')
+        trig_dur=$( echo "$val" | awk '{print $4}')
+        limit_dur=$(echo "$val" | awk '{print $5}')
+        l2_en=$(    echo "$val" | awk '{print $6}')
+        [ -z "$l2_en" ] && l2_en="1"
+        port=$( echo "$key" | cut -d: -f1)
+        proto=$(echo "$key" | cut -d: -f2)
+
+        local sdir="${STATE_DIR}/${key//:/_}"
+        local status; status=$(cat "${sdir}/status" 2>/dev/null || echo "-")
+
+        # ── 状态文字 ──────────────────────────────────────
+        local status_str status_color
+        if [ "$l2_en" = "0" ]; then
+            case "$status" in
+                level1)
+                    status_str="限速中  ${rate1}"
+                    status_color="${GREEN}"
+                    ;;
+                *)
+                    status_str="未启动"
+                    status_color="${DIM}"
+                    ;;
+            esac
+        else
+            case "$status" in
+                level1)
+                    status_str="1级限速  ${rate1}"
+                    status_color="${GREEN}"
+                    ;;
+                level2)
+                    local lu; lu=$(cat "${sdir}/limit_until" 2>/dev/null || echo 0)
+                    if [ "$lu" -gt 0 ] 2>/dev/null; then
+                        local remain=$(( lu - $(date +%s) ))
+                        [ "$remain" -lt 0 ] && remain=0
+                        status_str="2级限速  ${rate2}  剩余 $(format_duration "$remain")"
+                    else
+                        status_str="2级限速  ${rate2}  [永久]"
+                    fi
+                    status_color="${RED}"
+                    ;;
+                *)
+                    status_str="未启动"
+                    status_color="${DIM}"
+                    ;;
+            esac
+        fi
+
+        # ── 2级开关 ───────────────────────────────────────
+        local l2_badge
+        if [ "$l2_en" = "1" ]; then
+            l2_badge="${BOLD}${GREEN}[2级:ON ]${NC}"
+        else
+            l2_badge="${DIM}[2级:OFF]${NC}"
+        fi
+
+        # ── 卡片标题行 ────────────────────────────────────
+        printf "${BOLD}${CYAN}|${NC}  ${BOLD}${YELLOW}#%-2s${NC}  端口 ${BOLD}%-6s${NC} 协议 ${BOLD}%-5s${NC}  %b  %b${status_color}%s${NC}\n" \
+            "$idx" "$port" "$proto" "$l2_badge" "${status_color}●${NC} " "$status_str"
+        printf "${BOLD}${CYAN}|${NC}  ${DIM}%s${NC}\n" "$HL2"
+
+        # ── 1级参数行 ────────────────────────────────────
+        printf "${BOLD}${CYAN}|${NC}  ${CYAN}1级速率${NC}  ${BOLD}%-10s${NC}" "$rate1"
+
+        # ── 2级参数（按开关决定是否显示）────────────────
+        if [ "$l2_en" = "1" ]; then
+            printf "  ${YELLOW}触发阈值${NC}  ${BOLD}%-8s${NC}  ${YELLOW}持续时间${NC}  ${BOLD}%s${NC}\n" \
+                "${trig_bw}Mbps" "$(format_duration "$trig_dur")"
+            printf "${BOLD}${CYAN}|${NC}  ${RED}2级速率${NC}  ${BOLD}%-10s${NC}  ${RED}限速时长${NC}  ${BOLD}%s${NC}\n" \
+                "$rate2" "$(format_duration "${limit_dur:-0}")"
+        else
+            printf "  ${DIM}(2级已关闭，仅1级永久限速)${NC}\n"
+        fi
+
+        # 规则间分隔（最后一条后画底边）
+        if [ "$idx" -lt "${#PORT_RULES[@]}" ]; then
+            printf "${BOLD}${CYAN}|${NC}\n"
+        fi
+    done
+
+    printf "${BOLD}${CYAN}+%s+${NC}\n\n" "$HL"
 }
+
 
 # ─────────────────────────────────────────────────────────
 # 交互式：添加/修改规则向导
