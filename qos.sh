@@ -23,7 +23,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
 SCRIPT_SELF="$(realpath "$0" 2>/dev/null || readlink -f "$0")"
 QOS_BIN="/usr/bin/qos"
-QOS_VERSION="3.1.6"
+QOS_VERSION="3.1.7"
 QOS_UPDATE_URL="https://raw.githubusercontent.com/lyp88997/Server-QoS-Pro/refs/heads/main/qos.sh"
 
 _is_internal_cmd() {
@@ -472,8 +472,10 @@ monitor_daemon() {
         # 对每个规则下发/更新 TC 限速
         for key in "${!PORT_RULES[@]}"; do
             local val="${PORT_RULES[$key]}"
-            local rate1 port proto
+            local rate1 l2_en port proto
             rate1=$(echo "$val" | awk '{print $1}')
+            l2_en=$(echo "$val" | awk '{print $6}')
+            [ -z "$l2_en" ] && l2_en="1"
             port=$( echo "$key" | cut -d: -f1)
             proto=$(echo "$key" | cut -d: -f2)
             local hh="${PORT_HANDLE[$key]}"
@@ -483,12 +485,12 @@ monitor_daemon() {
             local cur_status; cur_status=$(cat "${sdir}/status" 2>/dev/null || echo "")
 
             if [ -z "$cur_status" ]; then
-                # 全新端口：初始化为 level1
+                # 全新端口或状态文件丢失（如 /run 被清空）：强制初始化
                 tc_limit_port "$port" "$proto" "$rate1" "$hh"
                 echo "level1" > "${sdir}/status"
                 rm -f "${sdir}/high_since" "${sdir}/limit_until"
                 ok "端口 ${BOLD}${port}${NC}(${proto})  1级限速已启用: ${BOLD}${rate1}${NC}"
-                log "端口 $port($proto) 新增，1级限速: $rate1"
+                log "端口 $port($proto) 初始化/恢复，1级限速: $rate1"
             elif [ "$cur_status" = "level1" ]; then
                 # 已在 level1，更新速率（参数可能变了）
                 tc_limit_port "$port" "$proto" "$rate1" "$hh"
@@ -538,9 +540,20 @@ monitor_daemon() {
 
             local sdir="${STATE_DIR}/${key//:/_}"
             mkdir -p "$sdir"
-            local status; status=$(cat "${sdir}/status" 2>/dev/null || echo "level1")
             local handle="${PORT_HANDLE[$key]:-10}"
             local ts; ts=$(date '+%H:%M:%S')
+
+            # ── 自愈：状态文件丢失（/run 重启被清空 或 新增规则尚未初始化）
+            if [ ! -f "${sdir}/status" ]; then
+                tc_limit_port "$port" "$proto" "$rate1" "$handle"
+                echo "level1" > "${sdir}/status"
+                rm -f "${sdir}/high_since" "${sdir}/limit_until"
+                printf "${GREEN}[%s]${NC} 端口 ${BOLD}%s${NC}(%s)  自愈初始化 -> 1级限速 ${BOLD}%s${NC}\n" \
+                    "$ts" "$port" "$proto" "$rate1"
+                log "端口 $port($proto) 自愈初始化，1级限速: $rate1"
+            fi
+
+            local status; status=$(cat "${sdir}/status" 2>/dev/null || echo "level1")
 
             # ── 2级关闭：仅维持1级，打印状态即跳过 ─────────
             if [ "$l2_en" = "0" ]; then
@@ -804,6 +817,13 @@ show_rules() {
         local sdir="${STATE_DIR}/${key//:/_}"
         local status; status=$(cat "${sdir}/status" 2>/dev/null || echo "-")
 
+        # 判断监控是否在运行（用于状态文字区分）
+        local _mon_running=false
+        local _mpid_f="${STATE_DIR}/monitor.pid"
+        if [ -f "$_mpid_f" ] && kill -0 "$(cat "$_mpid_f" 2>/dev/null)" 2>/dev/null; then
+            _mon_running=true
+        fi
+
         # ── 状态文字 ──────────────────────────────────────
         local status_str status_color
         if [ "$l2_en" = "0" ]; then
@@ -813,8 +833,13 @@ show_rules() {
                     status_color="${GREEN}"
                     ;;
                 *)
-                    status_str="未启动"
-                    status_color="${DIM}"
+                    if $_mon_running; then
+                        status_str="初始化中..."
+                        status_color="${YELLOW}"
+                    else
+                        status_str="监控未运行"
+                        status_color="${DIM}"
+                    fi
                     ;;
             esac
         else
@@ -835,8 +860,13 @@ show_rules() {
                     status_color="${RED}"
                     ;;
                 *)
-                    status_str="未启动"
-                    status_color="${DIM}"
+                    if $_mon_running; then
+                        status_str="初始化中..."
+                        status_color="${YELLOW}"
+                    else
+                        status_str="监控未运行"
+                        status_color="${DIM}"
+                    fi
                     ;;
             esac
         fi
