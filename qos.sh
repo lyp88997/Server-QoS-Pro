@@ -23,7 +23,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
 SCRIPT_SELF="$(realpath "$0" 2>/dev/null || readlink -f "$0")"
 QOS_BIN="/usr/bin/qos"
-QOS_VERSION="3.1.7"
+QOS_VERSION="3.2.0"
 QOS_UPDATE_URL="https://raw.githubusercontent.com/lyp88997/Server-QoS-Pro/refs/heads/main/qos.sh"
 
 _is_internal_cmd() {
@@ -377,6 +377,56 @@ tc_unlimit_port() {
 }
 
 # 清除所有 TC 规则和 iptables mark 规则
+stop_and_clear_all() {
+    require_root
+    printf "\n"
+    printf "${BOLD}${RED}  停止监控并清理所有限速规则${NC}\n"
+    printf "  此操作将:\n"
+    printf "  ${RED}-${NC} 停止监控守护进程\n"
+    printf "  ${RED}-${NC} 清除所有 TC 队列和限速类\n"
+    printf "  ${RED}-${NC} 清除所有 iptables mark 规则\n"
+    printf "  ${RED}-${NC} 清除所有端口运行时状态\n"
+    printf "  ${DIM}(配置文件和端口规则定义不受影响)${NC}\n"
+    printf "\n"
+    read -rp "  确认执行? [y/N]: " confirm
+    [[ "${confirm}" =~ ^[Yy]$ ]] || { warn "已取消"; return; }
+
+    printf "\n"
+
+    # 1. 停止监控进程
+    step "停止监控守护进程..."
+    stop_monitor 2>/dev/null
+    sleep 1
+
+    # 2. 清除 iptables mark 规则
+    step "清除 iptables mark 规则..."
+    load_config
+    local h=10
+    for key in "${!PORT_RULES[@]}"; do
+        local port proto
+        port=$(echo "$key" | cut -d: -f1)
+        proto=$(echo "$key" | cut -d: -f2)
+        _ipt_clear_port "$port" "$proto" "$h" 2>/dev/null || true
+        h=$(( h + 10 ))
+    done
+    ok "iptables mark 规则已清除"
+
+    # 3. 清除 TC 队列
+    step "清除 TC 队列和限速类..."
+    tc qdisc del dev "$INTERFACE" root 2>/dev/null || true
+    ok "TC 规则已清除 (接口: ${INTERFACE})"
+
+    # 4. 清除运行时状态文件
+    step "清除运行时状态..."
+    rm -rf "${STATE_DIR}"
+    mkdir -p "${STATE_DIR}"
+    ok "运行时状态已清除"
+
+    printf "\n"
+    ok "全部清理完成，端口恢复不限速状态"
+    log "手动停止并清理所有 TC/iptables/状态"
+}
+
 clear_rules() {
     load_config
     local h=10
@@ -1286,23 +1336,24 @@ interactive_menu() {
         printf "  4) 启动监控\n"
         printf "  5) 停止监控\n"
         printf "  6) 手动恢复端口至 1级限速\n"
+        printf "  ${RED}7) 停止监控并清理所有限速规则${NC}\n"
         printf "%s\n" "$_sep"
         printf "  ${BOLD}[ 配置与系统 ]${NC}\n"
-        printf "  7) 保存配置\n"
-        printf "  8) 更改网络接口\n"
-        printf "  9) 修改监控采样间隔 (当前: %ss)\n" "$MONITOR_INTERVAL"
-        printf "  10) 查看 TC 底层状态\n"
-        printf "  11) 查看运行日志\n"
+        printf "  8) 保存配置\n"
+        printf "  9) 更改网络接口\n"
+        printf "  10) 修改监控采样间隔 (当前: %ss)\n" "$MONITOR_INTERVAL"
+        printf "  11) 查看 TC 底层状态\n"
+        printf "  12) 查看运行日志\n"
         printf "%s\n" "$_sep"
-        printf "  12) 安装/更新系统服务 (开机自启)\n"
-        printf "  13) 卸载系统服务\n"
-        printf "  14) 重新检测/安装依赖\n"
+        printf "  13) 安装/更新系统服务 (开机自启)\n"
+        printf "  14) 卸载系统服务\n"
+        printf "  15) 重新检测/安装依赖\n"
         if $_update_available; then
-            printf "  ${BOLD}${YELLOW}15) 在线更新 -> v%s${NC}\n" "$_remote_ver"
+            printf "  ${BOLD}${YELLOW}U) 在线更新 -> v%s${NC}\n" "$_remote_ver"
         else
-            printf "  15) 检查在线更新\n"
+            printf "  16) 检查在线更新\n"
         fi
-        printf "  16) 清理旧配置并重新安装 (保留规则)\n"
+        printf "  17) 清理旧配置并重新安装 (保留规则)\n"
         printf "  0) 退出\n"
         printf "%s\n" "$_sep"
         read -rp "  请选择: " choice
@@ -1317,18 +1368,18 @@ interactive_menu() {
                 read -rp "  端口号: " up; read -rp "  协议 (tcp/udp/both): " upr
                 unlimit_port_now "$up" "${upr:-tcp}"
                 ;;
-            7) save_config ;;
-            8) change_interface ;;
-            9) change_interval ;;
-            10) show_tc_status ;;
-            11) show_log ;;
-            12) save_config; install_service ;;
-            13)   uninstall_service ;;
-            14) bootstrap_deps force ;;
-            15)   do_update ;;
-            16)
+            7) stop_and_clear_all ;;
+            8) save_config ;;
+            9) change_interface ;;
+            10) change_interval ;;
+            11) show_tc_status ;;
+            12) show_log ;;
+            13) save_config; install_service ;;
+            14) uninstall_service ;;
+            15) bootstrap_deps force ;;
+            16) do_update ;;
+            17)
                 do_clean_reinstall
-                # 清理完重新检测更新状态
                 _remote_ver=$(_remote_version "$QOS_UPDATE_URL" 2>/dev/null)
                 if [ -n "$_remote_ver" ] && _version_lt "$QOS_VERSION" "$_remote_ver"; then
                     _update_available=true
